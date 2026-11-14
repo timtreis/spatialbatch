@@ -6,11 +6,15 @@ from typing import TYPE_CHECKING
 
 from annbatch.samplers import RandomSampler as _AnnbatchRandomSampler
 
+from ._rows import RowsMixin
+
 if TYPE_CHECKING:
     import numpy as np
 
+    from ._rows import Rows
 
-class RandomSampler(_AnnbatchRandomSampler):
+
+class RandomSampler(RowsMixin, _AnnbatchRandomSampler):
     """Shuffled chunk-based sampler for batched tile access.
 
     This is :class:`annbatch.samplers.RandomSampler` (and thereby :class:`annbatch.abc.Sampler`) unchanged in behaviour:
@@ -34,6 +38,9 @@ class RandomSampler(_AnnbatchRandomSampler):
         Number of chunks to load per iteration.
     mask
         A slice defining the observation range to sample from (start:stop).
+    rows
+        The rows to sample from instead of `mask`: a slice, a sequence of slices, an integer index array or a boolean
+        mask over the loader's rows (see :class:`~spatialbatch.samplers.RowsMixin`).
     drop_last
         Whether to drop the last incomplete batch.
     rng
@@ -54,6 +61,7 @@ class RandomSampler(_AnnbatchRandomSampler):
         num_samples: int | None = None,
         drop_last: bool = False,
         mask: slice | None = None,
+        rows: Rows | None = None,
         rng: np.random.Generator | None = None,
     ):
         super().__init__(
@@ -66,3 +74,4 @@ class RandomSampler(_AnnbatchRandomSampler):
             mask=mask,
             rng=rng,
         )
+        self._init_rows(rows)

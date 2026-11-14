@@ -61,6 +61,35 @@ loader = Loader(images=["he"], labels=["cells"], crop_px=224, batch_size=32).use
 b = next(iter(loader)); print(b["images"]["he"].shape, b["labels"]["cells"].shape, b["X"].shape)'
 ```
 
+### Train/validation split
+
+`rows=` restricts sampling to a subset of the collection's global rows: a slice, a list of slices, an integer array
+or a boolean mask. Global rows run through the datasets in order (dataset `i` starts at the sum of the earlier
+datasets' `n_obs`), and `batch["dataset"]` says which dataset each row came from. Within a dataset the rows are
+Morton-sorted on `obsm["spatial"]`, so a range of rows is a compact region of the slide, and a contiguous range is
+read as contiguous chunks.
+
+```python
+import numpy as np
+from spatialbatch import Loader, SpatialDatasetCollection
+
+collection = SpatialDatasetCollection("atera-he.zarr")
+n = [g["obsm"]["spatial"].shape[0] for g in collection]  # rows per dataset, in collection order
+start = np.concatenate([[0], np.cumsum(n)])
+
+held_out = 5  # one whole slide for validation
+val = [slice(start[held_out], start[held_out + 1])]
+# plus the last 10% of the rows of every other slide: spatial tails, compact regions
+val += [slice(start[i + 1] - n[i] // 10, start[i + 1]) for i in range(len(n)) if i != held_out]
+is_val = np.zeros(start[-1], bool)
+for s in val:
+    is_val[s] = True
+
+common = dict(images=["he"], labels=["cells"], crop_px=224, batch_size=32, return_index=True)
+train = Loader(**common, shuffle=True, rows=~is_val).use_collection(collection)
+valid = Loader(**common, rows=val).use_collection(collection)
+```
+
 ## Getting started
 
 Please refer to the [documentation][],

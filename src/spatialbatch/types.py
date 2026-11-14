@@ -38,6 +38,8 @@ class SpatialLoaderOutput(TypedDict):
         The ``var`` annotations.
     index
         Position of each row in the loader (across all added SpatialData objects), or ``None``.
+    dataset
+        Which added dataset each row comes from, ``(batch,)`` int, in the order they were added.
     images
         ``{image name: (batch, channels, height, width)}``.
     labels
@@ -50,6 +52,7 @@ class SpatialLoaderOutput(TypedDict):
     obs: pd.DataFrame | None
     var: pd.DataFrame | None
     index: np.ndarray | None
+    dataset: np.ndarray
     images: dict[str, TileArray_T]
     labels: dict[str, TileArray_T]
     coords: np.ndarray | None

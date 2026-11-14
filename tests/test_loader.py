@@ -157,3 +157,81 @@ def test_concatenated_indptr_holds_offsets_past_the_part_dtype(synthetic):
     out = loader._concatenate_outs(outs())
     np.testing.assert_array_equal(out.elems[2], [0, 40_000, 70_000, 70_003, 70_007])
     assert out.elems[0].size == 70_007
+
+
+# -- rows= and the dataset id ------------------------------------------------------------------------------------------
+
+
+def test_rows_two_ranges_over_two_datasets_visit_each_row_once(synthetic, make, tmp_path):
+    sdata, _ = synthetic
+    other, _ = make(tmp_path / "b.zarr", n_cells=150, seed=1)
+    rows = [slice(20, 90), slice(230, 300)]  # one range in each dataset (200 + 150 rows)
+    loader = _loader(
+        batch_size=16, chunk_size=8, preload_nchunks=4, shuffle=True, rng=np.random.default_rng(0), rows=rows
+    ).add_sdatas([sdata, other], **KW)
+    batches = list(loader)
+    index = np.concatenate([b["index"] for b in batches])
+    expected = np.r_[20:90, 230:300]
+    np.testing.assert_array_equal(np.sort(index), expected)  # each selected row exactly once
+    assert not np.array_equal(index, expected)  # shuffled
+    assert len(loader) == len(batches) == -(-expected.size // 16)
+    dataset = np.concatenate([b["dataset"] for b in batches])
+    np.testing.assert_array_equal(dataset, (index >= 200).astype(int))
+
+
+def test_rows_mask_index_array_and_slices_select_the_same_rows(synthetic, make, tmp_path):
+    sdata, _ = synthetic
+    other, _ = make(tmp_path / "b.zarr", n_cells=150, seed=1)
+    mask = np.zeros(350, bool)
+    mask[[*range(5, 40), *range(190, 260), 349]] = True
+    seen = []
+    for rows in (mask, np.flatnonzero(mask)[::-1], [slice(5, 40), slice(190, 260), slice(349, 350)]):
+        loader = _loader(batch_size=8, chunk_size=8, preload_nchunks=2, rows=rows).add_sdatas([sdata, other], **KW)
+        seen.append(np.concatenate([b["index"] for b in loader]))
+    np.testing.assert_array_equal(seen[0], np.flatnonzero(mask))  # sequential: in row order
+    np.testing.assert_array_equal(seen[1], seen[0])
+    np.testing.assert_array_equal(seen[2], seen[0])
+
+
+def test_rows_chunks_keep_contiguous_runs_as_slices():
+    from spatialbatch.samplers._rows import _chunks
+
+    assert _chunks(np.arange(10, 30), 8) == [[slice(10, 18)], [slice(18, 26)], [slice(26, 30)]]
+    assert _chunks(np.r_[0:5, 9:12], 4) == [[slice(0, 4)], [slice(4, 5), slice(9, 12)]]
+
+
+def test_rows_rejects_bad_input(synthetic):
+    sdata, _ = synthetic
+    with pytest.raises(ValueError, match="length n_obs"):
+        list(_loader(batch_size=10, chunk_size=10, preload_nchunks=2, rows=np.ones(5, bool)).add_sdata(sdata, **KW))
+    with pytest.raises(ValueError, match="no row"):
+        list(_loader(batch_size=10, chunk_size=10, preload_nchunks=2, rows=[]).add_sdata(sdata, **KW))
+
+
+def test_dataset_id_of_each_row(synthetic, make, tmp_path):
+    sdata, _ = synthetic
+    other, _ = make(tmp_path / "b.zarr", n_cells=150, seed=1)
+    loader = _loader(
+        batch_size=25, chunk_size=25, preload_nchunks=2, shuffle=True, rng=np.random.default_rng(1)
+    ).add_sdatas([sdata, other], **KW)
+    for batch in loader:
+        np.testing.assert_array_equal(batch["dataset"], (batch["index"] >= 200).astype(int))
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_rows_with_torch_workers(synthetic, num_workers):
+    torch_data = pytest.importorskip("torch.utils.data")
+    sdata, _ = synthetic
+    loader = _loader(
+        batch_size=10,
+        chunk_size=10,
+        preload_nchunks=2,
+        shuffle=True,
+        drop_last=True,
+        rng=np.random.default_rng(0),
+        rows=[slice(0, 60), slice(100, 180)],
+        to="torch",
+    ).add_sdata(sdata, **KW)
+    dataloader = torch_data.DataLoader(loader, batch_size=None, num_workers=num_workers, collate_fn=_identity)
+    index = np.concatenate([np.asarray(b["index"]) for b in dataloader])
+    np.testing.assert_array_equal(np.sort(index), np.r_[0:60, 100:180])

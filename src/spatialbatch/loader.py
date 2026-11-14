@@ -154,7 +154,7 @@ class Loader(AnnbatchLoader):
         Called on every :class:`~spatialbatch.types.SpatialLoaderOutput` before it is yielded.
     batch_sampler
         If not provided, a :class:`~spatialbatch.samplers.RandomSampler` (if `shuffle`) or
-        :class:`~annbatch.samplers.SequentialSampler` is built from the arguments below.
+        :class:`~spatialbatch.samplers.SequentialSampler` is built from the arguments below.
     chunk_size
         Number of consecutive cells per chunk. Mutually exclusive with `batch_sampler`. Defaults to 64.
     preload_nchunks
@@ -168,7 +168,12 @@ class Loader(AnnbatchLoader):
     rng
         Random number generator for shuffling. Mutually exclusive with `batch_sampler`.
     return_index
-        Whether to yield the position of each row in the loader.
+        Whether to yield the position of each row in the loader: its global row, the datasets' rows in the order they
+        were added (dataset ``i`` starts at the sum of the earlier datasets' ``n_obs``).
+    rows
+        Sample only these rows of the loader: a slice, a sequence of slices, an integer index array or a boolean
+        mask over the global rows (see `return_index`). Chunks are drawn inside them, and a contiguous range is read
+        as contiguous chunks. Mutually exclusive with `batch_sampler`.
     to
         Output library for `X` and for the tiles.
 
@@ -220,6 +225,7 @@ class Loader(AnnbatchLoader):
         drop_last: bool | None = None,
         rng: np.random.Generator | None = None,
         return_index: bool = False,
+        rows: slice | Sequence[slice] | np.ndarray | None = None,
         to: Literal["torch", "jax"] | None = None,
     ):
         if batch_sampler is None:
@@ -230,9 +236,14 @@ class Loader(AnnbatchLoader):
                 "drop_last": drop_last,
             }
             resolved = {k: Loader._COMMON_SAMPLER_ARGS[k] if v is None else v for k, v in core.items()}
-            batch_sampler = RandomSampler(**resolved, rng=rng) if shuffle else SequentialSampler(**resolved)
+            if shuffle:
+                batch_sampler = RandomSampler(**resolved, rng=rng, rows=rows)
+            else:
+                batch_sampler = SequentialSampler(**resolved, rows=rows)
             super().__init__(batch_sampler=batch_sampler, return_index=return_index, preload_to_gpu=False, to=to)
         else:  # let annbatch reject sampler arguments that conflict with a custom sampler
+            if rows is not None:
+                raise ValueError("rows is a sampler argument: pass it to the batch_sampler instead")
             super().__init__(
                 batch_sampler=batch_sampler,
                 chunk_size=chunk_size,
@@ -542,6 +553,7 @@ class Loader(AnnbatchLoader):
 
             obs = self._maybe_accumulate_obs(dataset_index_to_rows)
             index = self._maybe_accumulate_indices(dataset_index_to_rows)
+            dataset = np.concatenate([np.full(len(rows), idx, np.int64) for idx, rows in dataset_index_to_rows.items()])
             coords = self._maybe_accumulate_coords(dataset_index_to_rows)
             for split in splits:
                 sel = inv[split]
@@ -551,6 +563,7 @@ class Loader(AnnbatchLoader):
                     "obs": obs.iloc[sel] if obs is not None else None,
                     "var": self._var,
                     "index": index[sel] if index is not None else None,
+                    "dataset": dataset[sel],
                     "images": {name: self._convert_tiles(pixels[name][sel]) for name in self._image_names},
                     "labels": {name: self._convert_tiles(pixels[name][sel]) for name in self._label_names},
                     "coords": coords[sel] if coords is not None else None,
