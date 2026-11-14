@@ -125,3 +125,35 @@ def test_errors(synthetic, make, tmp_path):
     with pytest.raises(ValueError, match="same modalities"):
         loader.add_sdata(three_channels, **KW)
     assert loader.n_obs == 200  # the failed add left the loader untouched
+
+
+def test_concatenated_indptr_holds_offsets_past_the_part_dtype(synthetic):
+    """A batch over two datasets where the second adds < 65536 nonzeros after an offset > 65535 (annbatch 0.3.1)."""
+    from collections import OrderedDict
+
+    from annbatch import Loader as AnnbatchLoader
+    from annbatch.utils import CSRContainer
+
+    sdata, _ = synthetic
+    loader = _loader(batch_size=10, chunk_size=10, preload_nchunks=2).add_sdata(sdata, **KW)
+    n_var = loader.n_var
+
+    def part(nnz_per_row: list[int]) -> CSRContainer:
+        indptr = np.concatenate([[0], np.cumsum(nnz_per_row)])
+        nnz = int(indptr[-1])
+        indptr = indptr.astype(np.min_scalar_type(nnz))  # as annbatch's _allocate_out sizes it
+        return CSRContainer(
+            elems=(np.ones(nnz, np.float32), np.arange(nnz, dtype=np.int32) % n_var, indptr),
+            shape=(len(nnz_per_row), n_var),
+            dtype=np.float32,
+        )
+
+    def outs():
+        return OrderedDict([(0, part([40_000, 30_000])), (1, part([3, 4]))])
+
+    assert outs()[1].elems[2].dtype == np.uint8
+    with pytest.raises(OverflowError):  # plain annbatch
+        AnnbatchLoader._concatenate_outs(loader, outs())
+    out = loader._concatenate_outs(outs())
+    np.testing.assert_array_equal(out.elems[2], [0, 40_000, 70_000, 70_003, 70_007])
+    assert out.elems[0].size == 70_007

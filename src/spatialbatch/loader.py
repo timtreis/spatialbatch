@@ -12,7 +12,7 @@ import numpy as np
 import zarr
 import zarr.core.sync as zsync
 from annbatch import Loader as AnnbatchLoader
-from annbatch.utils import check_lt_1, convert, load_all_aligned
+from annbatch.utils import CSRContainer, check_lt_1, convert, load_all_aligned
 from spatialdata import bounding_box_query
 from spatialdata import rasterize as spatialdata_rasterize
 from xarray import DataArray, DataTree
@@ -487,6 +487,24 @@ class Loader(AnnbatchLoader):
             self._index_datasets(dataset_index_to_rows), self._index_pixels(dataset_index_to_rows)
         )
         return x, pixels
+
+    def _concatenate_outs(self, outs: OrderedDict[int, Any]) -> Any:
+        """Annbatch's concatenation, with each dataset's ``indptr`` first cast to the dtype of the output ``indptr``.
+
+        annbatch 0.3.1 allocates a dataset's ``indptr`` as ``np.min_scalar_type`` of that dataset's nnz in the batch
+        (``Loader._allocate_out``) and adds the running nnz offset to it (``Loader._concatenate_outs``). Under NumPy 2
+        promotion a ``uint16`` ``indptr`` plus an offset above 65535 raises ``OverflowError``: a batch over several
+        datasets fails when a later dataset adds fewer than 65536 nonzeros. Drop this once annbatch casts it.
+        """
+        values = list(outs.values())
+        if values and isinstance(values[0], CSRContainer):
+            dtype = np.min_scalar_type(sum(o.elems[0].size for o in values))
+            for key, o in outs.items():
+                data, indices, indptr = o.elems
+                outs[key] = CSRContainer(
+                    elems=(data, indices, indptr.astype(dtype, copy=False)), shape=o.shape, dtype=o.dtype
+                )
+        return super()._concatenate_outs(outs)
 
     def _maybe_accumulate_coords(self, dataset_index_to_rows: OrderedDict[int, np.ndarray]) -> np.ndarray | None:
         coords = [self._items[idx].coords for idx in dataset_index_to_rows]
