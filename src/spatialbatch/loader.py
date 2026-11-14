@@ -502,8 +502,9 @@ class Loader(AnnbatchLoader):
     def _concatenate_outs(self, outs: OrderedDict[int, Any]) -> Any:
         """Annbatch's concatenation, with each dataset's ``indptr`` first cast to the dtype of the output ``indptr``.
 
-        annbatch 0.3.1 allocates a dataset's ``indptr`` as ``np.min_scalar_type`` of that dataset's nnz in the batch
-        (``Loader._allocate_out``) and adds the running nnz offset to it (``Loader._concatenate_outs``). Under NumPy 2
+        When the datasets do not share a dtype, annbatch 0.3.1 allocates a dataset's ``indptr`` as
+        ``np.min_scalar_type`` of that dataset's nnz in the batch (``Loader._allocate_per_dataset_outs``) and adds the
+        running nnz offset to it (``Loader._concatenate_outs``). Under NumPy 2
         promotion a ``uint16`` ``indptr`` plus an offset above 65535 raises ``OverflowError``: a batch over several
         datasets fails when a later dataset adds fewer than 65536 nonzeros. Drop this once annbatch casts it.
         """
