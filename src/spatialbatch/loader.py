@@ -285,6 +285,7 @@ class Loader(AnnbatchLoader):
         self._genes = None if genes is None else list(genes)
         self._gene_columns: np.ndarray | None = None
         self._shared_rows: Any = None  # a shared torch bool mask over the rows, set by to_torch for its workers
+        self._shared_evaluate: Any = None  # a shared torch bool flag: the workers' pass is an evaluation (set_rows)
         self._full_var: pd.DataFrame | None = None  # a collection's var with its columns, for `genes` and batch var
 
     # -- adding data ---------------------------------------------------------------------------------------------
@@ -466,7 +467,8 @@ class Loader(AnnbatchLoader):
           (``annbatch/samplers/_chunk_sampler.py``, ``_validate_worker_mode``). If the loader built its sampler and
           `drop_last` was not given, it is set to ``True`` here: each worker then skips at most its last
           ``batch_size - 1`` rows. A sampler that was given, or ``drop_last=False``, raises instead. annbatch also
-          refuses several workers for a sampler that does not shuffle;
+          refuses several workers for a sampler that does not shuffle. An evaluation pass (:meth:`set_rows` with
+          ``evaluate=True``) needs neither: it yields every row once with any number of workers;
         - `pin_memory` defaults to whether CUDA is available, `persistent_workers` to ``num_workers > 0``.
 
         The DataLoader applies torch's ``default_convert`` to every batch, so the arrays (tiles, ``index``,
@@ -487,7 +489,7 @@ class Loader(AnnbatchLoader):
 
         if "batch_size" in kwargs or "batch_sampler" in kwargs or "sampler" in kwargs:
             raise ValueError("the loader makes its own batches: do not pass batch_size, batch_sampler or sampler")
-        if num_workers > 1:
+        if num_workers > 1 and not getattr(self._batch_sampler, "_evaluate", False):
             sampler = self._batch_sampler
             if not getattr(sampler, "shuffle", True):
                 raise ValueError(
@@ -504,6 +506,7 @@ class Loader(AnnbatchLoader):
 
         if num_workers > 0 and isinstance(self._batch_sampler, RowsMixin):
             self._shared_rows = torch.from_numpy(self._rows_mask(self._batch_sampler._rows)).share_memory_()
+            self._shared_evaluate = torch.tensor([self._batch_sampler._evaluate]).share_memory_()
         if pin_memory is None:
             pin_memory = torch.cuda.is_available()
         if persistent_workers is None:
@@ -517,15 +520,25 @@ class Loader(AnnbatchLoader):
             **kwargs,
         )
 
-    def set_rows(self, rows: slice | Sequence[slice] | np.ndarray | None) -> Self:
+    def set_rows(self, rows: slice | Sequence[slice] | np.ndarray | None, *, evaluate: bool = False) -> Self:
         """Sample `rows` (see the `rows` parameter; ``None`` for all) from the next iteration on.
 
         This lets one loader, and the workers of its :meth:`to_torch` DataLoader, serve several row sets, e.g. a
         training and a validation split, instead of one loader (and one set of workers, each with its own copy of the
-        loader) per split. The sampler keeps its other settings: with workers the validation rows are shuffled and
-        each worker drops at most its last ``batch_size - 1`` of them. Persistent workers keep the loader they were
-        started with, so :meth:`to_torch` gives them a shared row mask, which this method updates and each worker
-        reads when an epoch starts (``iter(dataloader)``). Call it between epochs, not while one is running.
+        loader) per split. Persistent workers keep the loader they were started with, so :meth:`to_torch` gives them
+        a shared row mask and evaluation flag, which this method updates and each worker reads when an epoch starts
+        (``iter(dataloader)``). Call it between epochs, not while one is running.
+
+        Parameters
+        ----------
+        rows
+            The rows to sample, as the `rows` parameter of the loader.
+        evaluate
+            ``False``: the sampler keeps its settings, so with workers the rows are shuffled and each worker drops at
+            most its last ``batch_size - 1`` of them (annbatch needs ``drop_last`` with several workers).
+            ``True``: an evaluation pass, every row exactly once: in row order, split into one contiguous share per
+            worker, nothing shuffled or dropped. Batches can then be shorter than ``batch_size``, and with workers
+            they arrive interleaved across the shares. Use it for validation and inference.
         """
         from spatialbatch.samplers._rows import RowsMixin
 
@@ -535,10 +548,12 @@ class Loader(AnnbatchLoader):
             raise TypeError("set_rows needs a spatialbatch sampler (RandomSampler or SequentialSampler)")
         mask = self._rows_mask(rows)  # checks `rows` now, not at the next epoch
         self._batch_sampler._rows = rows
+        self._batch_sampler._evaluate = bool(evaluate)
         if self._shared_rows is not None:
             import torch
 
             self._shared_rows.copy_(torch.from_numpy(mask))
+            self._shared_evaluate.fill_(bool(evaluate))
         return self
 
     def _rows_mask(self, rows: Any) -> np.ndarray:
@@ -560,6 +575,7 @@ class Loader(AnnbatchLoader):
             return
         mask = self._shared_rows.numpy().copy()
         self._batch_sampler._rows = None if mask.all() else mask
+        self._batch_sampler._evaluate = bool(self._shared_evaluate[0])
 
     @property
     def n_tiles_px(self) -> tuple[int, int]:

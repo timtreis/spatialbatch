@@ -69,9 +69,15 @@ class RowsMixin:
     annbatch, and the shorter last chunk is always last. Worker sharding and the per-worker batch RNG follow
     ``annbatch.samplers._chunk_sampler._ChunkSampler._sample``. Sampling with replacement or ``num_samples`` is not
     supported together with `rows`.
+
+    With ``_evaluate`` set (:meth:`spatialbatch.Loader.set_rows` with ``evaluate=True``) a pass yields every selected
+    row exactly once, with or without workers: the chunks stay in row order, each worker takes a contiguous share of
+    them (``np.array_split``, as annbatch shards its slices), and nothing is shuffled or dropped, so a request's last
+    batch may be shorter than `batch_size`.
     """
 
     _rows: Rows | None = None
+    _evaluate: bool = False
 
     def _init_rows(self, rows: Rows | None) -> None:
         self._rows = rows
@@ -87,12 +93,23 @@ class RowsMixin:
         return None
 
     def n_batches(self, n_obs: int) -> int:
+        if self._evaluate:  # without workers; each worker's share ends with its own short batches
+            per = self._preload_nchunks  # type: ignore[attr-defined]
+            chunks = _chunks(self._selected(n_obs), self._chunk_size)  # type: ignore[attr-defined]
+            sizes = [sum(s.stop - s.start for c in chunks[i : i + per] for s in c) for i in range(0, len(chunks), per)]
+            return sum(math.ceil(n / self.batch_size) for n in sizes)  # type: ignore[attr-defined]
         if self._rows is None:
             return super().n_batches(n_obs)  # type: ignore[misc]
         total = resolve_rows(self._rows, n_obs).size
         return total // self.batch_size if self._drop_last else math.ceil(total / self.batch_size)  # type: ignore[attr-defined]
 
+    def _selected(self, n_obs: int) -> np.ndarray:
+        return resolve_rows(slice(None) if self._rows is None else self._rows, n_obs)
+
     def _sample(self, n_obs: int) -> Iterator[LoadRequest]:
+        if self._evaluate:
+            yield from self._sample_all_once(n_obs)
+            return
         if self._rows is None:
             yield from super()._sample(n_obs)  # type: ignore[misc]
             return
@@ -110,16 +127,32 @@ class RowsMixin:
             chunks = [chunks[i] for i in shard]
         yield from self._requests(chunks, batch_rng)
 
-    def _requests(self, chunks: list[list[slice]], batch_rng: np.random.Generator) -> Iterator[LoadRequest]:
+    def _sample_all_once(self, n_obs: int) -> Iterator[LoadRequest]:
+        """Every selected row once, in row order; each worker a contiguous share of the chunks. No shuffle, no drop.
+
+        annbatch's ``_validate_worker_mode`` (shuffle and drop_last with several workers) guards against workers
+        drawing overlapping or uneven shares of a shuffled pass; a fixed split of the chunks has neither problem.
+        """
+        worker_info = get_torch_worker_info()
+        chunks = _chunks(self._selected(n_obs), self._chunk_size)  # type: ignore[attr-defined]
+        if worker_info is not None:
+            shard = np.array_split(np.arange(len(chunks)), worker_info.num_workers)[worker_info.id]
+            chunks = [chunks[i] for i in shard]
+        yield from self._requests(chunks, None)
+
+    def _requests(self, chunks: list[list[slice]], batch_rng: np.random.Generator | None) -> Iterator[LoadRequest]:
+        """Requests of `preload_nchunks` chunks each; without `batch_rng` (evaluation) in order and without a drop."""
         per = self._preload_nchunks  # type: ignore[attr-defined]
         groups = [chunks[i : i + per] for i in range(0, len(chunks), per)]
-        batch_size, shuffle = self.batch_size, self.shuffle  # type: ignore[attr-defined]
+        batch_size = self.batch_size  # type: ignore[attr-defined]
+        shuffle = batch_rng is not None and self.shuffle  # type: ignore[attr-defined]
+        drop_last = batch_rng is not None and self._drop_last  # type: ignore[attr-defined]
         for i, group in enumerate(groups):
             requests = [s for chunk in group for s in chunk]
             n = int(sum(s.stop - s.start for s in requests))
-            if i == len(groups) - 1 and self._drop_last:  # type: ignore[attr-defined]
+            if i == len(groups) - 1 and drop_last:
                 if n < batch_size:
                     return
                 n -= n % batch_size
-            indices = batch_rng.permutation(n) if shuffle else np.arange(n)
+            indices = batch_rng.permutation(n) if shuffle else np.arange(n)  # type: ignore[union-attr]
             yield {"requests": requests, "splits": split_given_size(indices, batch_size)}

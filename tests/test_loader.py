@@ -301,3 +301,41 @@ def test_set_rows_reaches_persistent_workers(synthetic):
     assert set(val) <= set(range(120, 200)) and len(val) >= 80 - 2 * 9
     loader.set_rows(slice(0, 120))
     assert set(np.concatenate([b["index"].numpy() for b in dataloader])) <= set(range(120))
+
+
+@pytest.mark.parametrize("num_workers", [0, 1, 3])
+def test_evaluate_covers_every_row_once_with_workers(synthetic, num_workers):
+    pytest.importorskip("torch")
+    sdata, _ = synthetic
+    # batch_size 16 does not divide a request (2 chunks of 10 rows): a shuffled pass with workers would drop rows
+    loader = _loader(
+        batch_size=16, chunk_size=10, preload_nchunks=2, shuffle=True, rng=np.random.default_rng(0), rows=slice(0, 120)
+    ).add_sdata(sdata, **KW)
+    dataloader = loader.to_torch(num_workers=num_workers, pin_memory=False)
+    train = np.concatenate([b["index"].numpy() for b in dataloader])
+    assert set(train) <= set(range(120))
+    for rows, expected in ((slice(120, 200), np.arange(120, 200)), (None, np.arange(200))):
+        loader.set_rows(rows, evaluate=True)
+        batches = [b["index"].numpy() for b in dataloader]
+        index = np.concatenate(batches)
+        np.testing.assert_array_equal(np.sort(index), expected)  # every row, none twice
+        assert all(0 < len(b) <= 16 for b in batches)
+        if num_workers == 0:
+            np.testing.assert_array_equal(index, expected)  # in row order
+            assert len(batches) == len(loader)
+    loader.set_rows(slice(0, 120))  # back to training: shuffled, and with workers the incomplete batches dropped
+    train = np.concatenate([b["index"].numpy() for b in dataloader])
+    assert set(train) <= set(range(120))
+    if num_workers > 1:
+        assert len(train) % 16 == 0
+
+
+def test_evaluation_loader_without_shuffle_takes_workers(synthetic):
+    pytest.importorskip("torch")
+    sdata, _ = synthetic
+    loader = _loader(batch_size=16, chunk_size=10, preload_nchunks=2).add_sdata(sdata, **KW)
+    with pytest.raises(ValueError, match="does not shuffle"):
+        loader.to_torch(num_workers=2)
+    loader.set_rows(None, evaluate=True)
+    index = np.concatenate([b["index"].numpy() for b in loader.to_torch(num_workers=2, pin_memory=False)])
+    np.testing.assert_array_equal(np.sort(index), np.arange(200))
