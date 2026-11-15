@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
     from .loader import _Item
 
-__all__ = ["SpatialDatasetCollection", "write_collection_dataset", "write_sharded_sdata"]
+__all__ = ["SpatialDatasetCollection", "spatial_split", "write_collection_dataset", "write_sharded_sdata"]
 
 #: Key of the group attribute that describes how a dataset of a collection was written.
 ENCODING_KEY = "spatialbatch"
@@ -625,6 +625,43 @@ class SpatialDatasetCollection(DatasetCollection):
         self._cached_var = first[shared].copy()
         return self._cached_var
 
+    @property
+    def n_obs_per_dataset(self) -> list[int]:
+        """The rows (cells) of each dataset, in the order the loader reads them. Reads only the ``obs`` index shape."""
+        out = []
+        for group in self:
+            obs = group["obs"]
+            out.append(int(obs[obs.attrs["_index"]].shape[0]))
+        return out
+
+    @property
+    def n_obs(self) -> int:
+        """The rows of the collection: the ``n_obs`` of a :class:`~spatialbatch.Loader` that uses it."""
+        return sum(self.n_obs_per_dataset)
+
+    @property
+    def offsets(self) -> np.ndarray:
+        """The loader row of each dataset's first row: dataset ``d`` holds rows ``offsets[d]`` to ``offsets[d + 1]``.
+
+        Its length is the number of datasets plus one, and the last value is :attr:`n_obs`. A batch's ``index`` (the
+        loader row, with ``return_index=True``) is ``offsets[batch["dataset"]]`` plus the row within its dataset; see
+        :meth:`locate`.
+        """
+        return np.concatenate([[0], np.cumsum(self.n_obs_per_dataset)]).astype(np.int64)
+
+    def locate(self, index: Any) -> tuple[np.ndarray, np.ndarray]:
+        """``(dataset, row within the dataset)`` of each loader row in `index`, e.g. a batch's ``index``.
+
+        The row within the dataset is the row of that dataset's ``obs`` and ``X``, which are sorted along the
+        Morton curve when written, so not the source table's order.
+        """
+        index = np.asarray(index, dtype=np.int64)
+        offsets = self.offsets
+        if index.size and (index.min() < 0 or index.max() >= offsets[-1]):
+            raise IndexError(f"index must be in [0, {offsets[-1]})")
+        dataset = np.searchsorted(offsets, index, side="right") - 1
+        return dataset, index - offsets[dataset]
+
     def add_adatas(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
         """Not supported: a dataset of this collection holds pixels, written by :meth:`add_sdatas`."""
         raise TypeError("A SpatialDatasetCollection holds pixels too: use `add_sdatas`.")
@@ -646,3 +683,28 @@ class SpatialDatasetCollection(DatasetCollection):
         first = len(self._dataset_keys)
         for i, path in enumerate(tqdm(paths, desc="Adding to collection")):
             write_sharded_sdata(self._group, sd.read_zarr(path), key=f"{DATASET_PREFIX}_{first + i}", **kwargs)
+
+
+def spatial_split(collection: SpatialDatasetCollection, frac: float) -> tuple[list[slice], list[slice]]:
+    """``(train, held_out)``: the last `frac` of every dataset's rows held out, as loader ``rows``.
+
+    Within each dataset the rows are sorted along a Morton curve of the cell positions, so a dataset's last rows are a
+    compact region of its slide (the last quadrants of the curve), not a random sample. Each list holds one slice per
+    dataset and can be passed as ``Loader(rows=...)`` or :meth:`~spatialbatch.Loader.set_rows`.
+
+    Parameters
+    ----------
+    collection
+        The collection the loader uses.
+    frac
+        The share of each dataset's rows to hold out, in ``(0, 1)``. A dataset holds out ``round(frac * n)`` rows.
+    """
+    if not 0 < frac < 1:
+        raise ValueError(f"frac must be in (0, 1), got {frac}")
+    offsets = collection.offsets
+    train, held_out = [], []
+    for start, stop in zip(offsets[:-1].tolist(), offsets[1:].tolist(), strict=True):
+        cut = stop - round(frac * (stop - start))
+        train.append(slice(start, cut))
+        held_out.append(slice(cut, stop))
+    return train, held_out

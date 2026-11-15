@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import zarr
 
-from spatialbatch import Loader, SpatialDatasetCollection
+from spatialbatch import Loader, SpatialDatasetCollection, spatial_split
 from spatialbatch.utils import morton_order
 
 TILE = 32
@@ -99,6 +99,40 @@ def test_collection_matches_in_place_loading(collection, synthetic):
                 np.testing.assert_array_equal(batch["images"]["img"][row], by_id[key])
                 compared += 1
     assert compared == 200
+
+
+def test_rows_offsets_and_locate(collection):
+    collection, _ = collection
+    assert collection.n_obs_per_dataset == [200, 150]
+    assert collection.n_obs == 350
+    np.testing.assert_array_equal(collection.offsets, [0, 200, 350])
+    dataset, row = collection.locate([0, 199, 200, 349])
+    np.testing.assert_array_equal(dataset, [0, 0, 1, 1])
+    np.testing.assert_array_equal(row, [0, 199, 0, 149])
+    with pytest.raises(IndexError):
+        collection.locate([350])
+    loader = Loader(images=["img"], batch_size=50, return_index=True).use_collection(collection)
+    assert loader.n_obs == collection.n_obs
+    from anndata.io import read_elem
+
+    labels = [read_elem(g["obs"])["label"].to_numpy() for g in collection]
+    for batch in loader:  # a batch's index maps to its dataset and the row of that dataset's obs
+        dataset, row = collection.locate(batch["index"])
+        np.testing.assert_array_equal(dataset, batch["dataset"])
+        expected = [labels[d][r] for d, r in zip(dataset, row, strict=True)]
+        np.testing.assert_array_equal(batch["obs"]["label"].to_numpy(), expected)
+
+
+def test_spatial_split_holds_out_each_dataset_tail(collection):
+    collection, _ = collection
+    train, held_out = spatial_split(collection, 0.2)
+    assert train == [slice(0, 160), slice(200, 320)]
+    assert held_out == [slice(160, 200), slice(320, 350)]
+    with pytest.raises(ValueError, match="frac"):
+        spatial_split(collection, 1.0)
+    loader = Loader(images=["img"], batch_size=50, return_index=True, rows=held_out).use_collection(collection)
+    index = np.concatenate([b["index"] for b in loader])
+    np.testing.assert_array_equal(np.sort(index), np.r_[160:200, 320:350])
 
 
 def test_collection_errors(synthetic, tmp_path):
