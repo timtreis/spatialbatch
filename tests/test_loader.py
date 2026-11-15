@@ -235,3 +235,69 @@ def test_rows_with_torch_workers(synthetic, num_workers):
     dataloader = torch_data.DataLoader(loader, batch_size=None, num_workers=num_workers, collate_fn=_identity)
     index = np.concatenate([np.asarray(b["index"]) for b in dataloader])
     np.testing.assert_array_equal(np.sort(index), np.r_[0:60, 100:180])
+
+
+# -- to_torch ----------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_to_torch_sets_up_the_dataloader(synthetic, num_workers):
+    torch = pytest.importorskip("torch")
+    sdata, _ = synthetic
+    loader = _loader(batch_size=10, chunk_size=10, preload_nchunks=2, shuffle=True, rng=np.random.default_rng(0))
+    loader = loader.add_sdata(sdata, **KW)
+    dataloader = loader.to_torch(num_workers=num_workers, pin_memory=False)
+    assert dataloader.batch_size is None
+    assert dataloader.persistent_workers is (num_workers > 0)
+    batches = list(dataloader)
+    index = np.concatenate([b["index"].numpy() for b in batches])
+    assert all(isinstance(b["images"]["img"], torch.Tensor) for b in batches)
+    assert all(isinstance(b["dataset"], torch.Tensor) for b in batches)
+    assert len(np.unique(index)) == len(index)
+    if num_workers > 1:  # drop_last set for the workers: each worker drops at most its last batch_size - 1 rows
+        assert loader.batch_sampler._drop_last and len(index) % 10 == 0 and len(index) >= 200 - num_workers * 9
+    else:
+        assert len(index) == 200
+    assert len(list(dataloader)) == len(batches)  # persistent workers serve a second epoch
+
+
+def test_to_torch_refuses_what_annbatch_refuses(synthetic):
+    pytest.importorskip("torch")
+    sdata, _ = synthetic
+    with pytest.raises(ValueError, match="does not shuffle"):
+        _loader(batch_size=10, chunk_size=10).add_sdata(sdata, **KW).to_torch(num_workers=2)
+    explicit = _loader(batch_size=10, chunk_size=10, shuffle=True, drop_last=False).add_sdata(sdata, **KW)
+    with pytest.raises(ValueError, match="drop_last=True"):
+        explicit.to_torch(num_workers=2)
+    with pytest.raises(ValueError, match="batch_size"):
+        explicit.to_torch(batch_size=4)
+
+
+def test_set_rows_without_workers(synthetic):
+    sdata, _ = synthetic
+    loader = _loader(batch_size=10, chunk_size=10, preload_nchunks=2, rows=slice(0, 50)).add_sdata(sdata, **KW)
+    assert np.concatenate([b["index"] for b in loader]).tolist() == list(range(50))
+    loader.set_rows(slice(150, 200))
+    assert np.concatenate([b["index"] for b in loader]).tolist() == list(range(150, 200))
+    loader.set_rows(None)
+    assert len(np.concatenate([b["index"] for b in loader])) == 200
+    with pytest.raises(ValueError, match="no row"):
+        loader.set_rows([])
+
+
+def test_set_rows_reaches_persistent_workers(synthetic):
+    pytest.importorskip("torch")
+    sdata, _ = synthetic
+    loader = _loader(
+        batch_size=10, chunk_size=10, preload_nchunks=2, shuffle=True, rng=np.random.default_rng(0), rows=slice(0, 120)
+    ).add_sdata(sdata, **KW)
+    dataloader = loader.to_torch(num_workers=2, pin_memory=False)
+    train = np.concatenate([b["index"].numpy() for b in dataloader])
+    pids = {w.pid for w in dataloader._iterator._workers}
+    loader.set_rows(slice(120, 200))
+    val = np.concatenate([b["index"].numpy() for b in dataloader])
+    assert {w.pid for w in dataloader._iterator._workers} == pids  # the same worker processes
+    assert set(train) <= set(range(120)) and len(train) >= 120 - 2 * 9
+    assert set(val) <= set(range(120, 200)) and len(val) >= 80 - 2 * 9
+    loader.set_rows(slice(0, 120))
+    assert set(np.concatenate([b["index"].numpy() for b in dataloader])) <= set(range(120))

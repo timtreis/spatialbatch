@@ -111,3 +111,12 @@ def make():
 @pytest.fixture
 def ref_tile():
     return reference_tile
+
+
+@pytest.fixture(autouse=True)
+def _validation_cache(tmp_path, monkeypatch):
+    """Each test records validated collections in its own dir, and starts with none recorded in the process."""
+    from spatialbatch import io
+
+    monkeypatch.setenv("SPATIALBATCH_CACHE_DIR", str(tmp_path / "spatialbatch-cache"))
+    monkeypatch.setattr(io, "_VALIDATED", set())

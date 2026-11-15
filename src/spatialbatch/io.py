@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import warnings
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -9,7 +13,6 @@ import numpy as np
 import scipy.sparse as sp
 import zarr
 from annbatch.io import DATASET_PREFIX, V1_ENCODING, DatasetCollection, write_sharded
-from annbatch.utils import load_all_aligned
 from tqdm.auto import tqdm
 from zarr.codecs import ZstdCodec
 
@@ -400,8 +403,8 @@ def open_dataset_group(
         raise ValueError(
             f"{missing} are not in the collection, which has images {meta['images']} and labels {meta['labels']}."
         )
-    adata = load_all_aligned(group)
-    coords = np.asarray(adata.obsm["spatial"][...]) if "spatial" in adata.obsm else None
+    X, obs, var, obsm = _read_table(group, annotations)
+    coords = np.asarray(obsm["spatial"][...]) if "spatial" in obsm else None
     if _version(meta["encoding-version"]) >= _version(CENTRES_VERSION):
         if crop_px is None:
             raise ValueError(f"{group.name} is tiled at read time: pass `crop_px` to the Loader.")
@@ -416,7 +419,7 @@ def open_dataset_group(
                 UserWarning,
                 stacklevel=4,
             )
-        origin = np.asarray(adata.obsm["tile_origin"][...]).astype(np.int64)
+        origin = np.asarray(obsm["tile_origin"][...]).astype(np.int64)
         height, width = meta["tile_hw"]
         geometry = TileGeometry(origin[:, 0], origin[:, 1], height, width)
     sources: dict[str, _Source] = {}
@@ -424,8 +427,43 @@ def open_dataset_group(
         for name in names:
             array = group[kind][name]
             sources[name] = _Source(kind, array, array.shape[0] if kind == "images" else None, array.dtype)
-    obs = adata.obs if annotations is None else adata.obs[list(annotations)]
-    return adata.X, None if len(obs.columns) == 0 else obs, adata.var, _Item(geometry, sources, coords)
+    return X, obs, var, _Item(geometry, sources, coords)
+
+
+def _read_table(
+    group: zarr.Group, annotations: Sequence[str] | None
+) -> tuple[Any, pd.DataFrame | None, pd.DataFrame, Mapping[str, Any]]:
+    """``X`` (backed), the ``obs`` columns the loader yields, the var index and the backed ``obsm`` of a dataset.
+
+    What :func:`annbatch.utils.load_all_aligned` reads, except that only the `annotations` columns of ``obs`` are read
+    (all of them for ``None``, none for an empty list): ``obs`` is the largest part of a dataset held in memory
+    (the cell ids and every column, for every cell), and the loader keeps it for the whole run.
+    """
+    import pandas as pd
+    from annbatch.utils import _read_backed
+    from anndata.io import read_elem
+
+    var = group["var"]
+    var_frame = pd.DataFrame(index=pd.Index(read_elem(var[var.attrs.get("_index")])))
+    obsm = {
+        k: _read_backed(v)
+        for k, v in (group["obsm"].members() if "obsm" in group else [])
+        if v.attrs.get("encoding-type") in {"csr_matrix", "array"}
+    }
+    obs_group = group["obs"]
+    if annotations is None:
+        obs = read_elem(obs_group)
+    elif len(annotations) == 0:
+        obs = None
+    else:
+        columns = list(obs_group.attrs.get("column-order", []))
+        if missing := [c for c in annotations if c not in columns]:
+            raise KeyError(f"{group.name}: obs has no columns {missing}; it has {columns}")
+        index = pd.Index(read_elem(obs_group[obs_group.attrs["_index"]]))
+        obs = pd.DataFrame({c: read_elem(obs_group[c]) for c in annotations}, index=index)
+    if obs is not None and len(obs.columns) == 0:
+        obs = None
+    return _read_backed(group["X"]), obs, var_frame, obsm
 
 
 def _contract_version(group: zarr.Group) -> str | None:
@@ -470,6 +508,64 @@ def _check_contract(group: zarr.Group) -> bool:
     return True
 
 
+def _cache_dir() -> Path:
+    """Where validated collections are recorded: ``$SPATIALBATCH_CACHE_DIR``, else ``~/.cache/spatialbatch``."""
+    return Path(os.environ.get("SPATIALBATCH_CACHE_DIR") or Path.home() / ".cache" / "spatialbatch")
+
+
+def _validation_key(groups: Sequence[zarr.Group], root: zarr.Group) -> str | None:
+    """What a validation of the collection depends on, hashed; ``None`` if it cannot be fixed cheaply.
+
+    The key covers the root's consolidated metadata (every array's shape, dtype, chunks and attributes, so a
+    rewritten or resized element changes it), each dataset's ``uns["sddb_contract"]`` (whose values are array data,
+    not metadata) and the version of the validator (``sddb``). Without consolidated metadata there is no key.
+    """
+    from anndata.io import read_elem
+
+    if root.metadata.consolidated_metadata is None:
+        return None
+    try:
+        import sddb
+        import sddb.contract as contract
+    except ImportError:
+        return None
+    parts = [json.dumps(root.metadata.to_dict(), sort_keys=True, default=str)]
+    parts += [getattr(sddb, "__version__", "unknown"), getattr(contract, "CONTRACT_VERSION", "unknown")]
+    for group in groups:
+        try:
+            parts.append(json.dumps(read_elem(group["uns"]["sddb_contract"]), sort_keys=True, default=str))
+        except KeyError:
+            parts.append("")
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def _check_collection(groups: Sequence[zarr.Group], root: zarr.Group) -> bool:
+    """:func:`_check_contract` on every dataset, once per collection: a collection that passed is recorded.
+
+    A pass is recorded under :func:`_validation_key` in this process and as a file in :func:`_cache_dir`, so a later
+    open of the same collection, in this process or another, skips the checks. A collection with issues is checked
+    again on every open. Returns whether every dataset was validated in full.
+    """
+    key = _validation_key(groups, root)
+    marker = None if key is None else _cache_dir() / "validated" / key
+    if key in _VALIDATED or (marker is not None and marker.is_file()):
+        _VALIDATED.add(key)
+        return True
+    validated = [_check_contract(group) for group in groups]  # every dataset, not only up to the first
+    if all(validated) and marker is not None:
+        _VALIDATED.add(key)
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({"collection": str(root.store), "datasets": [g.name for g in groups]}))
+        except OSError as e:  # a read-only home: the check runs again next time
+            warnings.warn(f"could not record the validation in {marker}: {e}", UserWarning, stacklevel=3)
+    return all(validated)
+
+
+#: Validation keys of the collections that passed in this process.
+_VALIDATED: set[str | None] = set()
+
+
 class SpatialDatasetCollection(DatasetCollection):
     """A collection of spatially sorted, sharded SpatialData datasets, for :meth:`spatialbatch.Loader.use_collection`.
 
@@ -497,6 +593,37 @@ class SpatialDatasetCollection(DatasetCollection):
         super().__init__(group, mode=mode)  # type: ignore[arg-type]
         if not isinstance(self._group, zarr.Group):
             raise TypeError("A SpatialDatasetCollection is always zarr.")
+        self._cached_var: pd.DataFrame | None = None
+
+    @property
+    def var(self) -> pd.DataFrame:
+        """The var shared by the datasets: the var index and the columns that are equal in every dataset.
+
+        Every dataset of a collection has one var index (the loader needs the same columns of `X`); this checks it.
+        A column that differs between datasets, such as an sddb collection's per-dataset ``var["present"]``, is left
+        out. In an sddb collection the index holds the Ensembl ids and the columns ``gene_ids``, ``feature_types`` and
+        ``original_var_name`` (the source name, e.g. the gene symbol).
+
+        Raises
+        ------
+        ValueError
+            If the collection is empty or its datasets have different var indexes.
+        """
+        from anndata.io import read_elem
+
+        if self._cached_var is not None:
+            return self._cached_var
+        groups = list(self)
+        if not groups:
+            raise ValueError("SpatialDatasetCollection is empty")
+        frames = [read_elem(g["var"]) for g in groups]
+        first = frames[0]
+        for group, frame in zip(groups[1:], frames[1:], strict=True):
+            if not frame.index.equals(first.index):
+                raise ValueError(f"{group.name} has another var index than {groups[0].name}")
+        shared = [c for c in first.columns if all(c in f.columns and f[c].equals(first[c]) for f in frames[1:])]
+        self._cached_var = first[shared].copy()
+        return self._cached_var
 
     def add_adatas(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
         """Not supported: a dataset of this collection holds pixels, written by :meth:`add_sdatas`."""
@@ -514,6 +641,7 @@ class SpatialDatasetCollection(DatasetCollection):
         """
         import spatialdata as sd
 
+        self._cached_var = None
         paths = list(sdata_paths)
         first = len(self._dataset_keys)
         for i, path in enumerate(tqdm(paths, desc="Adding to collection")):

@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 import numpy as np
+import pandas as pd
 import zarr
 import zarr.core.sync as zsync
 from annbatch import Loader as AnnbatchLoader
@@ -33,7 +34,6 @@ if TYPE_CHECKING:
     from collections import OrderedDict
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
-    import pandas as pd
     from spatialdata import SpatialData
 
     from spatialbatch.io import SpatialDatasetCollection
@@ -149,7 +149,9 @@ class Loader(AnnbatchLoader):
     pad_value
         Value of pixels outside the array.
     return_annotations
-        `obs` columns to keep and yield. By default all are.
+        `obs` columns to keep and yield. By default all are. A collection's datasets read only these columns of
+        `obs` (none for ``[]``): `obs` is the largest part of a dataset held in memory, and reading it is a large part
+        of :meth:`use_collection`.
     transform
         Called on every :class:`~spatialbatch.types.SpatialLoaderOutput` before it is yielded.
     batch_sampler
@@ -174,8 +176,16 @@ class Loader(AnnbatchLoader):
         Sample only these rows of the loader: a slice, a sequence of slices, an integer index array or a boolean
         mask over the global rows (see `return_index`). Chunks are drawn inside them, and a contiguous range is read
         as contiguous chunks. Mutually exclusive with `batch_sampler`.
+    genes
+        Yield only these columns of `X`, dense ``float32`` ``(batch, len(genes))`` in the order given, and the matching
+        rows of `var`. A name is looked up in the var index (the Ensembl id in an sddb collection), then in
+        ``var["original_var_name"]`` (the source name, e.g. the gene symbol) of a collection that has it. ``None``
+        yields all of `X`, sparse.
     to
         Output library for `X` and for the tiles.
+
+    Build a loader once and iterate it many times: opening a collection reads every dataset's ``obs`` and checks its
+    contract (see :meth:`use_collection`). With a torch :class:`~torch.utils.data.DataLoader`, use :meth:`to_torch`.
 
     Examples
     --------
@@ -226,8 +236,11 @@ class Loader(AnnbatchLoader):
         rng: np.random.Generator | None = None,
         return_index: bool = False,
         rows: slice | Sequence[slice] | np.ndarray | None = None,
+        genes: Sequence[str] | None = None,
         to: Literal["torch", "jax"] | None = None,
     ):
+        # whether to_torch may set drop_last: only on a sampler built here, where the caller left it unset
+        self._drop_last_settable = batch_sampler is None and drop_last is None
         if batch_sampler is None:
             core = {
                 "chunk_size": chunk_size,
@@ -267,6 +280,12 @@ class Loader(AnnbatchLoader):
         self._annotations = [return_annotations] if isinstance(return_annotations, str) else return_annotations
         self.transform = transform
         self._items = []
+        if genes is not None and (isinstance(genes, str) or len(genes) == 0):
+            raise ValueError("`genes` must be a non-empty sequence of names")
+        self._genes = None if genes is None else list(genes)
+        self._gene_columns: np.ndarray | None = None
+        self._shared_rows: Any = None  # a shared torch bool mask over the rows, set by to_torch for its workers
+        self._full_var: pd.DataFrame | None = None  # a collection's var with its columns, for `genes` and batch var
 
     # -- adding data ---------------------------------------------------------------------------------------------
 
@@ -369,17 +388,19 @@ class Loader(AnnbatchLoader):
 
         A dataset that declares an sddb contract (``uns["sddb_contract"]``) is validated with
         ``sddb.contract.validate_dataset`` first, and refused if it does not conform. Without :mod:`sddb` installed,
-        only the contract version is checked.
+        only the contract version is checked. A collection that passed is not validated again: the pass is recorded
+        under a hash of the collection's consolidated metadata, its datasets' contracts and the sddb version, in this
+        process and in ``$SPATIALBATCH_CACHE_DIR`` (default ``~/.cache/spatialbatch``). A change to an array's data
+        that keeps its metadata (shape, dtype, attributes) is not noticed.
         """
-        from spatialbatch.io import _check_contract
+        from spatialbatch.io import _check_collection
 
         if collection.is_empty:
             raise ValueError("SpatialDatasetCollection is empty")
         if self._collection_added:
             raise RuntimeError("You should not add multiple collections; add them to one collection instead.")
         groups = list(collection)
-        validated = [_check_contract(group) for group in groups]  # every dataset, not only up to the first
-        if not all(validated):
+        if not _check_collection(groups, collection._group):
             warnings.warn(
                 "The collection declares an sddb contract but `sddb` is not installed, so only the contract version "
                 "was checked. Install `sddb` to validate it.",
@@ -388,6 +409,7 @@ class Loader(AnnbatchLoader):
             )
         for group in groups:
             self._add_group(group)
+        self._full_var = collection.var
         self._collection_added = True
         return self
 
@@ -403,6 +425,141 @@ class Loader(AnnbatchLoader):
         raise TypeError("A spatialbatch.Loader holds pixels too: use `add_sdata`, `add_sdatas` or `use_collection`.")
 
     add_adata = add_adatas = add_dataset = add_datasets = _unsupported  # type: ignore[assignment]
+
+    def _resolve_genes(self) -> np.ndarray:
+        """The columns of `X` that `genes` names, looked up once."""
+        if self._gene_columns is not None:
+            return self._gene_columns
+        assert self._genes is not None
+        var = self._full_var if self._full_var is not None else self._var
+        if var is None:
+            raise ValueError("`genes` needs the datasets' var, but the loader has none")
+        index = pd.Index(var.index.astype(str))
+        symbols = pd.Index(var["original_var_name"].astype(str)) if "original_var_name" in var.columns else None
+        columns, missing = [], []
+        for name in self._genes:
+            if (hit := index.get_indexer([name])[0]) >= 0:
+                columns.append(hit)
+            elif symbols is not None and (hits := np.flatnonzero(symbols == name)).size == 1:
+                columns.append(int(hits[0]))
+            elif symbols is not None and hits.size > 1:
+                raise ValueError(f"gene {name!r} is the original_var_name of {hits.size} features: pass its var name")
+            else:
+                missing.append(name)
+        if missing:
+            raise KeyError(f"genes not in the var index or var['original_var_name']: {missing[:10]}")
+        self._gene_columns = np.asarray(columns, dtype=np.intp)
+        return self._gene_columns
+
+    def to_torch(
+        self,
+        num_workers: int = 0,
+        *,
+        pin_memory: bool | None = None,
+        persistent_workers: bool | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """A :class:`torch.utils.data.DataLoader` over this loader, set up the way it needs.
+
+        - ``batch_size=None``: the loader makes the batches itself;
+        - with more than one worker the sampler must drop the last incomplete batch, which annbatch requires
+          (``annbatch/samplers/_chunk_sampler.py``, ``_validate_worker_mode``). If the loader built its sampler and
+          `drop_last` was not given, it is set to ``True`` here: each worker then skips at most its last
+          ``batch_size - 1`` rows. A sampler that was given, or ``drop_last=False``, raises instead. annbatch also
+          refuses several workers for a sampler that does not shuffle;
+        - `pin_memory` defaults to whether CUDA is available, `persistent_workers` to ``num_workers > 0``.
+
+        The DataLoader applies torch's ``default_convert`` to every batch, so the arrays (tiles, ``index``,
+        ``dataset``, ``coords``, and `X` with `genes`) arrive as tensors with any number of workers; build the loader
+        with ``to="torch"`` to get `X` as a torch sparse tensor too. Each worker holds its own copy of the loader.
+
+        Parameters
+        ----------
+        num_workers
+            Worker processes of the DataLoader.
+        pin_memory, persistent_workers
+            See :class:`torch.utils.data.DataLoader`.
+        **kwargs
+            Passed to :class:`torch.utils.data.DataLoader`, e.g. ``prefetch_factor``. `batch_size` must not be given.
+        """
+        import torch
+        from torch.utils.data import DataLoader
+
+        if "batch_size" in kwargs or "batch_sampler" in kwargs or "sampler" in kwargs:
+            raise ValueError("the loader makes its own batches: do not pass batch_size, batch_sampler or sampler")
+        if num_workers > 1:
+            sampler = self._batch_sampler
+            if not getattr(sampler, "shuffle", True):
+                raise ValueError(
+                    "annbatch does not support several workers with a sampler that does not shuffle; use shuffle=True "
+                    "(with drop_last) or num_workers <= 1"
+                )
+            if not getattr(sampler, "_drop_last", True) and sampler.batch_size > 1:
+                if not self._drop_last_settable:
+                    raise ValueError(
+                        "annbatch needs drop_last=True with several workers; build the Loader (or its sampler) with it"
+                    )
+                sampler._drop_last = True
+        from spatialbatch.samplers._rows import RowsMixin
+
+        if num_workers > 0 and isinstance(self._batch_sampler, RowsMixin):
+            self._shared_rows = torch.from_numpy(self._rows_mask(self._batch_sampler._rows)).share_memory_()
+        if pin_memory is None:
+            pin_memory = torch.cuda.is_available()
+        if persistent_workers is None:
+            persistent_workers = num_workers > 0
+        return DataLoader(
+            self,
+            batch_size=None,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            **kwargs,
+        )
+
+    def set_rows(self, rows: slice | Sequence[slice] | np.ndarray | None) -> Self:
+        """Sample `rows` (see the `rows` parameter; ``None`` for all) from the next iteration on.
+
+        This lets one loader, and the workers of its :meth:`to_torch` DataLoader, serve several row sets, e.g. a
+        training and a validation split, instead of one loader (and one set of workers, each with its own copy of the
+        loader) per split. The sampler keeps its other settings: with workers the validation rows are shuffled and
+        each worker drops at most its last ``batch_size - 1`` of them. Persistent workers keep the loader they were
+        started with, so :meth:`to_torch` gives them a shared row mask, which this method updates and each worker
+        reads when an epoch starts (``iter(dataloader)``). Call it between epochs, not while one is running.
+        """
+        from spatialbatch.samplers._rows import RowsMixin
+
+        if self._num_open_iters > 0:
+            raise RuntimeError("set_rows while the loader is being iterated; finish or close the iterator first")
+        if not isinstance(self._batch_sampler, RowsMixin):
+            raise TypeError("set_rows needs a spatialbatch sampler (RandomSampler or SequentialSampler)")
+        mask = self._rows_mask(rows)  # checks `rows` now, not at the next epoch
+        self._batch_sampler._rows = rows
+        if self._shared_rows is not None:
+            import torch
+
+            self._shared_rows.copy_(torch.from_numpy(mask))
+        return self
+
+    def _rows_mask(self, rows: Any) -> np.ndarray:
+        from spatialbatch.samplers._rows import resolve_rows
+
+        mask = np.ones(self.n_obs, bool)
+        if rows is not None:
+            mask[:] = False
+            mask[resolve_rows(rows, self.n_obs)] = True
+        return mask
+
+    def _rows_from_shared_mask(self) -> None:
+        """In a DataLoader worker: take the rows that :meth:`set_rows` last put in the shared mask."""
+        if self._shared_rows is None:
+            return
+        from annbatch.samplers._utils import get_torch_worker_info
+
+        if get_torch_worker_info() is None:
+            return
+        mask = self._shared_rows.numpy().copy()
+        self._batch_sampler._rows = None if mask.all() else mask
 
     @property
     def n_tiles_px(self) -> tuple[int, int]:
@@ -527,6 +684,7 @@ class Loader(AnnbatchLoader):
     def _iter(self) -> Iterator[SpatialLoaderOutput]:  # type: ignore[override]
         check_lt_1([len(self._train_datasets), self.n_obs], ["Number of datasets", "Number of observations"])
         is_sparse = not issubclass(self.dataset_type, zarr.Array)
+        self._rows_from_shared_mask()
         positions = np.empty(0, dtype=np.intp)
         for load_request in self._batch_sampler.sample(self.n_obs):
             requests_to_load = load_request.get("requests", None)
@@ -552,17 +710,25 @@ class Loader(AnnbatchLoader):
             else:
                 in_memory_data = self._np_module.asarray(raw_out)
 
+            genes = None
+            if self._genes is not None:
+                columns = self._resolve_genes()
+                part = in_memory_data[:, columns]
+                genes = np.asarray(part.toarray() if hasattr(part, "toarray") else part, dtype=np.float32)
+                var = self._batch_var(columns)
+            else:
+                var = self._var
             obs = self._maybe_accumulate_obs(dataset_index_to_rows)
             index = self._maybe_accumulate_indices(dataset_index_to_rows)
             dataset = np.concatenate([np.full(len(rows), idx, np.int64) for idx, rows in dataset_index_to_rows.items()])
             coords = self._maybe_accumulate_coords(dataset_index_to_rows)
             for split in splits:
                 sel = inv[split]
-                data = in_memory_data[sel]
+                data = in_memory_data[sel] if genes is None else genes[sel]
                 batch: SpatialLoaderOutput = {
                     "X": data if self._to is None else convert(data, False, self._to),
                     "obs": obs.iloc[sel] if obs is not None else None,
-                    "var": self._var,
+                    "var": var,
                     "index": index[sel] if index is not None else None,
                     "dataset": dataset[sel],
                     "images": {name: self._convert_tiles(pixels[name][sel]) for name in self._image_names},
@@ -570,6 +736,10 @@ class Loader(AnnbatchLoader):
                     "coords": coords[sel] if coords is not None else None,
                 }
                 yield batch if self.transform is None else self.transform(batch)
+
+    def _batch_var(self, columns: np.ndarray) -> pd.DataFrame | None:
+        var = self._full_var if self._full_var is not None else self._var
+        return None if var is None else var.iloc[columns]
 
     def _convert_tiles(self, tiles: np.ndarray) -> Any:
         return tiles if self._to is None else convert(tiles, False, self._to)

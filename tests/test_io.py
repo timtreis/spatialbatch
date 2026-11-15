@@ -312,3 +312,160 @@ def test_raw_is_written_in_order(tmp_path):
     group = next(iter(_write(tmp_path / "c.zarr", table, image, labels)))
     cells = np.asarray(group["obs"]["cell"][...])
     np.testing.assert_array_equal(ad.io.read_elem(group["raw"]["X"]).toarray(), expected[cells])
+
+
+# -- the collection's var and Loader(genes=) ---------------------------------------------------------------------------
+
+
+def _gene_collection(path, n_datasets=2):
+    """Datasets with one var index (``ENSG...``), symbols in ``original_var_name`` and a per-dataset ``present``."""
+    import pandas as pd
+
+    from spatialbatch import write_collection_dataset
+
+    group = zarr.open_group(path, mode="a")
+    tables = []
+    for i in range(n_datasets):
+        table, image, labels = _centred_table(seed=i)
+        table.var = pd.DataFrame(
+            {
+                "original_var_name": [f"G{j}" for j in range(20)],
+                "feature_types": ["Gene Expression"] * 18 + ["Control"] * 2,
+                "present": np.arange(20) != i,
+            },
+            index=[f"ENSG{j:011d}" for j in range(20)],
+        )
+        write_collection_dataset(
+            group, key=f"dataset_{i}", table=table, images={"img": image}, labels={"lab": labels}, **ARRAYS
+        )
+        tables.append(table)
+    return SpatialDatasetCollection(path), tables
+
+
+def test_collection_var_keeps_the_shared_columns(tmp_path):
+    collection, tables = _gene_collection(tmp_path / "c.zarr")
+    var = collection.var
+    assert list(var.index) == list(tables[0].var_names)
+    assert list(var.columns) == ["original_var_name", "feature_types"]  # "present" differs between the datasets
+    assert collection.var is var  # read once
+
+
+def test_collection_var_refuses_different_indexes(tmp_path):
+    import pandas as pd
+
+    from spatialbatch import write_collection_dataset
+
+    collection, _ = _gene_collection(tmp_path / "c.zarr", n_datasets=1)
+    table, image, labels = _centred_table(seed=5)
+    table.var = pd.DataFrame(index=[f"other{j}" for j in range(20)])
+    write_collection_dataset(
+        zarr.open_group(tmp_path / "c.zarr", mode="a"),
+        key="dataset_1",
+        table=table,
+        images={"img": image},
+        labels={"lab": labels},
+        **ARRAYS,
+    )
+    with pytest.raises(ValueError, match="another var index"):
+        _ = SpatialDatasetCollection(tmp_path / "c.zarr").var
+
+
+@pytest.mark.parametrize("by", ["index", "symbol"])
+def test_genes_yield_those_columns_dense_float32(tmp_path, by):
+    collection, tables = _gene_collection(tmp_path / "c.zarr")
+    picks = [7, 2, 15]
+    genes = [f"ENSG{j:011d}" for j in picks] if by == "index" else [f"G{j}" for j in picks]
+    loader = Loader(
+        images=["img"], crop_px=16, genes=genes, return_index=True, batch_size=20, chunk_size=10
+    ).use_collection(collection)
+    seen = 0
+    for batch in loader:
+        X = batch["X"]
+        assert isinstance(X, np.ndarray) and X.dtype == np.float32 and X.shape == (len(batch["index"]), 3)
+        assert list(batch["var"].index) == [f"ENSG{j:011d}" for j in picks]
+        for row, (cell, ds) in enumerate(zip(batch["obs"]["cell"], batch["dataset"], strict=True)):
+            expected = tables[ds].X[cell].toarray().ravel()[picks]
+            np.testing.assert_array_equal(X[row], expected.astype(np.float32))
+            seen += 1
+    assert seen == 400
+
+
+def test_genes_errors(tmp_path):
+    collection, _ = _gene_collection(tmp_path / "c.zarr", n_datasets=1)
+    with pytest.raises(KeyError, match="nope"):
+        next(iter(Loader(images=["img"], crop_px=16, genes=["G1", "nope"]).use_collection(collection)))
+    with pytest.raises(ValueError, match="non-empty"):
+        Loader(images=["img"], genes="G1")
+
+
+def test_sddb_contract_is_validated_once_per_collection(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from spatialbatch import io
+
+    table, image, labels = _centred_table(n_cells=40)
+    table.uns["sddb_contract"] = {"version": "0.1.0", "uid": "AAAAAAAAAAAAAAAA0001"}
+    collection = _write(tmp_path / "c.zarr", table, image, labels)
+    zarr.consolidate_metadata(tmp_path / "c.zarr")  # as sddb's materialize does last
+    calls = []
+    contract = types.ModuleType("sddb.contract")
+    contract.validate_dataset = lambda group: calls.append(group.name) or []
+    monkeypatch.setitem(sys.modules, "sddb", types.ModuleType("sddb"))
+    monkeypatch.setitem(sys.modules, "sddb.contract", contract)
+    kwargs = {"images": ["img"], "crop_px": 16}
+
+    def open_():
+        return Loader(**kwargs).use_collection(SpatialDatasetCollection(tmp_path / "c.zarr", mode="r"))
+
+    open_()
+    open_()
+    assert calls == ["/dataset_0"]  # the second open found the pass of the first in this process
+    monkeypatch.setattr(io, "_VALIDATED", set())
+    open_()
+    assert calls == ["/dataset_0"]  # ... and in another process, from the file in the cache dir
+    assert len(list((tmp_path / "spatialbatch-cache" / "validated").iterdir())) == 1
+
+    # a new version of the store (its uid) with the same metadata bytes is a new key: validated again
+    from anndata.io import write_elem
+
+    group = zarr.open_group(tmp_path / "c.zarr" / "dataset_0", mode="a", use_consolidated=False)
+    before = zarr.open_group(tmp_path / "c.zarr", mode="r").metadata.to_dict()
+    write_elem(group["uns"], "sddb_contract", {"version": "0.1.0", "uid": "AAAAAAAAAAAAAAAA0002"})
+    zarr.consolidate_metadata(tmp_path / "c.zarr")
+    assert zarr.open_group(tmp_path / "c.zarr", mode="r").metadata.to_dict() == before  # metadata unchanged
+    open_()
+    assert calls == ["/dataset_0"] * 2
+
+    # a failing collection is checked on every open
+    write_elem(group["uns"], "sddb_contract", {"version": "0.1.1", "uid": "AAAAAAAAAAAAAAAA0002"})
+    zarr.consolidate_metadata(tmp_path / "c.zarr")
+    contract.validate_dataset = lambda group: calls.append(group.name) or ["bad"]
+    for _ in range(2):
+        with pytest.raises(ValueError, match="bad"):
+            open_()
+    assert calls == ["/dataset_0"] * 4
+    del collection
+
+
+def test_return_annotations_reads_only_those_obs_columns(tmp_path, monkeypatch):
+    from anndata.io import read_elem
+
+    import spatialbatch.io as sio
+
+    table, image, labels = _centred_table()
+    table.obs["other"] = "x"
+    collection = _write(tmp_path / "c.zarr", table, image, labels)
+    read = []
+    monkeypatch.setattr(sio, "read_elem", lambda elem: read.append(elem.name) or read_elem(elem), raising=False)
+    kwargs = {"images": ["img"], "crop_px": 16, "batch_size": 20, "chunk_size": 10}
+    batch = next(iter(Loader(return_annotations=["cell"], **kwargs).use_collection(collection)))
+    assert list(batch["obs"].columns) == ["cell"]
+    assert batch["obs"].index.str.startswith("cell-").all()
+    batch = next(
+        iter(Loader(return_annotations=[], **kwargs).use_collection(SpatialDatasetCollection(tmp_path / "c.zarr")))
+    )
+    assert batch["obs"] is None
+    assert len(batch["images"]["img"]) == 20
+    with pytest.raises(KeyError, match="nope"):
+        Loader(return_annotations=["nope"], **kwargs).use_collection(SpatialDatasetCollection(tmp_path / "c.zarr"))
