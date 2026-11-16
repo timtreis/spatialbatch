@@ -307,9 +307,10 @@ def test_set_rows_reaches_persistent_workers(synthetic):
 def test_evaluate_covers_every_row_once_with_workers(synthetic, num_workers):
     pytest.importorskip("torch")
     sdata, _ = synthetic
-    # batch_size 16 does not divide a request (2 chunks of 10 rows): a shuffled pass with workers would drop rows
+    # chunks of 8 rows: with 3 workers a share of 80 or 200 rows is 4, 3, 3 or 9, 8, 8 chunks, which 16 does not
+    # divide, so a shuffled pass with workers would drop rows (annbatch needs 16 to divide a request of 2 chunks)
     loader = _loader(
-        batch_size=16, chunk_size=10, preload_nchunks=2, shuffle=True, rng=np.random.default_rng(0), rows=slice(0, 120)
+        batch_size=16, chunk_size=8, preload_nchunks=2, shuffle=True, rng=np.random.default_rng(0), rows=slice(0, 120)
     ).add_sdata(sdata, **KW)
     dataloader = loader.to_torch(num_workers=num_workers, pin_memory=False)
     train = np.concatenate([b["index"].numpy() for b in dataloader])
@@ -333,7 +334,7 @@ def test_evaluate_covers_every_row_once_with_workers(synthetic, num_workers):
 def test_evaluation_loader_without_shuffle_takes_workers(synthetic):
     pytest.importorskip("torch")
     sdata, _ = synthetic
-    loader = _loader(batch_size=16, chunk_size=10, preload_nchunks=2).add_sdata(sdata, **KW)
+    loader = _loader(batch_size=16, chunk_size=8, preload_nchunks=2).add_sdata(sdata, **KW)
     with pytest.raises(ValueError, match="does not shuffle"):
         loader.to_torch(num_workers=2)
     loader.set_rows(None, evaluate=True)
