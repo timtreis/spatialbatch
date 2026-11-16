@@ -631,7 +631,7 @@ class SpatialDatasetCollection(DatasetCollection):
         out = []
         for group in self:
             obs = group["obs"]
-            out.append(int(obs[obs.attrs["_index"]].shape[0]))
+            out.append(_elem_len(obs[obs.attrs["_index"]]))
         return out
 
     @property
@@ -683,6 +683,20 @@ class SpatialDatasetCollection(DatasetCollection):
         first = len(self._dataset_keys)
         for i, path in enumerate(tqdm(paths, desc="Adding to collection")):
             write_sharded_sdata(self._group, sd.read_zarr(path), key=f"{DATASET_PREFIX}_{first + i}", **kwargs)
+
+
+def _elem_len(elem: Any) -> int:
+    """The length of an anndata column from its metadata: an array, or a group encoding one.
+
+    anndata writes a string index as the group ``nullable-string-array`` (``values`` and ``mask``) where nullable
+    strings are on, and a categorical as ``codes`` and ``categories``.
+    """
+    if isinstance(elem, zarr.Array):
+        return int(elem.shape[0])
+    for key in ("values", "codes"):
+        if key in elem:
+            return int(elem[key].shape[0])
+    raise ValueError(f"cannot tell the length of {elem.name} (encoding {elem.attrs.get('encoding-type')!r})")
 
 
 def spatial_split(collection: SpatialDatasetCollection, frac: float) -> tuple[list[slice], list[slice]]:

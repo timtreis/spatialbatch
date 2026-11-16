@@ -123,6 +123,19 @@ def test_rows_offsets_and_locate(collection):
         np.testing.assert_array_equal(batch["obs"]["label"].to_numpy(), expected)
 
 
+def test_elem_len_reads_arrays_and_encoded_groups():
+    import pandas as pd
+    from anndata.io import write_elem
+
+    from spatialbatch.io import _elem_len
+
+    group = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    write_elem(group, "ints", np.arange(7))
+    write_elem(group, "cats", pd.Categorical(list("abcab")))
+    write_elem(group, "nullable", pd.array([1, None, 3], dtype="Int64"))
+    assert [_elem_len(group[k]) for k in ("ints", "cats", "nullable")] == [7, 5, 3]
+
+
 def test_spatial_split_holds_out_each_dataset_tail(collection):
     collection, _ = collection
     train, held_out = spatial_split(collection, 0.2)
