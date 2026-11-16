@@ -111,7 +111,7 @@ def test_rows_offsets_and_locate(collection):
     np.testing.assert_array_equal(row, [0, 199, 0, 149])
     with pytest.raises(IndexError):
         collection.locate([350])
-    loader = Loader(images=["img"], batch_size=50, return_index=True).use_collection(collection)
+    loader = Loader(images=["img"], batch_size=64, return_index=True).use_collection(collection)
     assert loader.n_obs == collection.n_obs
     from anndata.io import read_elem
 
@@ -143,7 +143,7 @@ def test_spatial_split_holds_out_each_dataset_tail(collection):
     assert held_out == [slice(160, 200), slice(320, 350)]
     with pytest.raises(ValueError, match="frac"):
         spatial_split(collection, 1.0)
-    loader = Loader(images=["img"], batch_size=50, return_index=True, rows=held_out).use_collection(collection)
+    loader = Loader(images=["img"], batch_size=64, return_index=True, rows=held_out).use_collection(collection)
     index = np.concatenate([b["index"] for b in loader])
     np.testing.assert_array_equal(np.sort(index), np.r_[160:200, 320:350])
 
