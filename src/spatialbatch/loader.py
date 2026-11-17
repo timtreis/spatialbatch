@@ -539,6 +539,13 @@ class Loader(AnnbatchLoader):
         ``dataset``, ``coords``, and `X` with `genes`) arrive as tensors with any number of workers; build the loader
         with ``to="torch"`` to get `X` as a torch sparse tensor too. Each worker holds its own copy of the loader.
 
+        With workers, each batch goes to the main process through torch's sharing strategy. Under the default
+        ``"file_descriptor"`` strategy the handoff capped 224 px H&E crops at about 6k cells/s with 4 to 12 workers;
+        ``to="torch"`` (so `X` is shared as tensors rather than pickled whole through the worker's pipe) plus
+        ``torch.multiprocessing.set_sharing_strategy("file_system")`` gave 1.3 to 1.4 times the cells/s. This method
+        warns but doesn't change the global strategy: ``"file_system"`` can leave ``torch_*`` files in ``/dev/shm``
+        when a process is killed, so a script that sets it should remove them on exit.
+
         Parameters
         ----------
         num_workers
@@ -571,6 +578,12 @@ class Loader(AnnbatchLoader):
         if num_workers > 0 and isinstance(self._batch_sampler, RowsMixin):
             self._shared_rows = torch.from_numpy(self._rows_mask(self._batch_sampler._rows)).share_memory_()
             self._shared_evaluate = torch.tensor([self._batch_sampler._evaluate]).share_memory_()
+        if num_workers > 0 and torch.multiprocessing.get_sharing_strategy() == "file_descriptor":
+            warnings.warn(
+                "torch's 'file_descriptor' sharing strategy limits how fast workers hand batches over; consider "
+                "to='torch' and torch.multiprocessing.set_sharing_strategy('file_system') (see Loader.to_torch)",
+                stacklevel=2,
+            )
         if pin_memory is None:
             pin_memory = torch.cuda.is_available()
         if persistent_workers is None:

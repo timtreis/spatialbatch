@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 from annbatch.samplers import SequentialSampler
@@ -259,6 +261,24 @@ def test_to_torch_sets_up_the_dataloader(synthetic, num_workers):
     else:
         assert len(index) == 200
     assert len(list(dataloader)) == len(batches)  # persistent workers serve a second epoch
+
+
+def test_to_torch_warns_under_the_file_descriptor_strategy(synthetic):
+    torch = pytest.importorskip("torch")
+    sdata, _ = synthetic
+    loader = _loader(batch_size=10, chunk_size=10, preload_nchunks=2, shuffle=True).add_sdata(sdata, **KW)
+    before = torch.multiprocessing.get_sharing_strategy()
+    try:
+        torch.multiprocessing.set_sharing_strategy("file_descriptor")
+        with pytest.warns(UserWarning, match="file_descriptor"):
+            loader.to_torch(num_workers=2, pin_memory=False)
+        torch.multiprocessing.set_sharing_strategy("file_system")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loader.to_torch(num_workers=2, pin_memory=False)
+        assert not [w for w in caught if "file_descriptor" in str(w.message)]
+    finally:
+        torch.multiprocessing.set_sharing_strategy(before)
 
 
 def test_to_torch_refuses_what_annbatch_refuses(synthetic):
