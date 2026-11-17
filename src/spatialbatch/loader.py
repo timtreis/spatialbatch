@@ -19,13 +19,14 @@ from spatialdata import bounding_box_query
 from spatialdata import rasterize as spatialdata_rasterize
 from xarray import DataArray, DataTree
 
-from spatialbatch.samplers import RandomSampler, SequentialSampler
+from spatialbatch.samplers import BlockSampler, RandomSampler, SequentialSampler
 
 from .utils import (
     TileGeometry,
     aligned_tiles,
     element_to_cs_matrix,
     is_identity_xy,
+    morton_codes,
     scale0,
     tile_starts,
     validate_inputs,
@@ -98,6 +99,7 @@ class _Item:
     geometry: TileGeometry
     sources: dict[str, _Source]
     coords: np.ndarray | None
+    blocks: np.ndarray | None = None  # per row, the writer's grid cell (a collection's ``morton_codes``)
 
 
 class _SpatialdataTile:
@@ -192,6 +194,11 @@ class Loader(AnnbatchLoader):
         Number of consecutive cells per chunk. Mutually exclusive with `batch_sampler`. Defaults to 64.
     preload_nchunks
         Number of chunks per request. Mutually exclusive with `batch_sampler`. Defaults to 8.
+    chunks
+        ``"rows"``: a chunk is `chunk_size` consecutive rows. ``"blocks"`` (with `shuffle`): a chunk is a block, the
+        rows that the collection writer sorted into one grid cell, and a request still holds
+        ``chunk_size * preload_nchunks`` rows (see :class:`~spatialbatch.samplers.BlockSampler`). Blocks read fewer,
+        fuller windows than row chunks of the same request size, with as many datasets per batch.
     shuffle
         Whether to shuffle. Mutually exclusive with `batch_sampler`. Defaults to ``False``.
     batch_size
@@ -275,6 +282,7 @@ class Loader(AnnbatchLoader):
         genes: Sequence[str] | None = None,
         to: Literal["torch", "jax"] | None = None,
         tile_threads: int | None = 4,
+        chunks: Literal["rows", "blocks"] = "rows",
     ):
         # whether to_torch may set drop_last: only on a sampler built here, where the caller left it unset
         self._drop_last_settable = batch_sampler is None and drop_last is None
@@ -286,7 +294,13 @@ class Loader(AnnbatchLoader):
                 "drop_last": drop_last,
             }
             resolved = {k: Loader._COMMON_SAMPLER_ARGS[k] if v is None else v for k, v in core.items()}
-            if shuffle:
+            if chunks not in ("rows", "blocks"):
+                raise ValueError(f"`chunks` must be 'rows' or 'blocks', got {chunks!r}")
+            if chunks == "blocks":
+                if not shuffle:
+                    raise ValueError("chunks='blocks' needs shuffle=True")
+                batch_sampler = BlockSampler(**resolved, rng=rng, rows=rows)
+            elif shuffle:
                 batch_sampler = RandomSampler(**resolved, rng=rng, rows=rows)
             else:
                 batch_sampler = SequentialSampler(**resolved, rows=rows)
@@ -294,6 +308,8 @@ class Loader(AnnbatchLoader):
         else:  # let annbatch reject sampler arguments that conflict with a custom sampler
             if rows is not None:
                 raise ValueError("rows is a sampler argument: pass it to the batch_sampler instead")
+            if chunks != "rows":
+                raise ValueError("chunks is a sampler argument: pass a BlockSampler as the batch_sampler instead")
             super().__init__(
                 batch_sampler=batch_sampler,
                 chunk_size=chunk_size,
@@ -329,6 +345,7 @@ class Loader(AnnbatchLoader):
         self._shared_rows: Any = None  # a shared torch bool mask over the rows, set by to_torch for its workers
         self._shared_evaluate: Any = None  # a shared torch bool flag: the workers' pass is an evaluation (set_rows)
         self._full_var: pd.DataFrame | None = None  # a collection's var with its columns, for `genes` and batch var
+        self._block_starts: np.ndarray | None = None
 
     # -- adding data ---------------------------------------------------------------------------------------------
 
@@ -422,6 +439,7 @@ class Loader(AnnbatchLoader):
         self._add_dataset_unchecked(X, obs, var)
         self._signature, self._tile_hw = signature, hw
         self._items.append(item)
+        self._block_starts = None
 
     def add_sdatas(self, sdatas: Sequence[SpatialData], **kwargs: Any) -> Self:
         """Append several SpatialData objects, see :meth:`add_sdata`."""
@@ -624,6 +642,27 @@ class Loader(AnnbatchLoader):
         self._batch_sampler._evaluate = bool(self._shared_evaluate[0])
 
     @property
+    def block_starts(self) -> np.ndarray:
+        """The first global row of every block, for :class:`~spatialbatch.samplers.BlockSampler`.
+
+        A block is a run of consecutive rows in one cell of the grid the rows were sorted on. For a collection dataset
+        written by :func:`~spatialbatch.write_collection_dataset` that is the writer's own grid
+        (``morton_codes(obsm["spatial"], block_px)``, as it sorted them); for other datasets, the 1024 px grid of the
+        tile centres. Every dataset starts a block. Computed from arrays the loader holds, without reading.
+        """
+        if self._block_starts is None:
+            starts, offset = [], 0
+            for item in self._items:
+                codes = item.blocks
+                if codes is None:
+                    g = item.geometry
+                    codes = morton_codes(g.x0 + g.width // 2, g.y0 + g.height // 2, _WINDOW_PX)
+                starts.append(offset + np.flatnonzero(np.concatenate([[True], codes[1:] != codes[:-1]])))
+                offset += codes.size
+            self._block_starts = np.concatenate(starts) if starts else np.empty(0, np.int64)
+        return self._block_starts
+
+    @property
     def n_tiles_px(self) -> tuple[int, int]:
         """Height and width in pixels of every tile."""
         if self._tile_hw is None:
@@ -752,6 +791,8 @@ class Loader(AnnbatchLoader):
         check_lt_1([len(self._train_datasets), self.n_obs], ["Number of datasets", "Number of observations"])
         is_sparse = not issubclass(self.dataset_type, zarr.Array)
         self._rows_from_shared_mask()
+        if isinstance(self._batch_sampler, BlockSampler):
+            self._batch_sampler.block_starts = self.block_starts
         positions = np.empty(0, dtype=np.intp)
         for load_request in self._batch_sampler.sample(self.n_obs):
             requests_to_load = load_request.get("requests", None)

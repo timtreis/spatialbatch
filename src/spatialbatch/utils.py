@@ -34,6 +34,7 @@ __all__ = [
     "element_to_cs_matrix",
     "get_tile_coords",
     "is_identity_xy",
+    "morton_codes",
     "morton_order",
     "round_half_up",
     "scale0",
@@ -239,6 +240,11 @@ def morton_order(x: np.ndarray, y: np.ndarray, block: int = 1024) -> np.ndarray:
     Cells that are close in the plane end up close in the order, so a run of consecutive cells reads a compact region
     of the image. Ties inside one grid cell keep their original order.
     """
+    return np.argsort(morton_codes(x, y, block), kind="stable")
+
+
+def morton_codes(x: np.ndarray, y: np.ndarray, block: int = 1024) -> np.ndarray:
+    """The Z-order code of the ``block``-sized grid cell that holds each point; one code per grid cell."""
     gx = np.maximum(np.floor_divide(np.asarray(x, dtype=np.float64), block), 0).astype(np.uint64)
     gy = np.maximum(np.floor_divide(np.asarray(y, dtype=np.float64), block), 0).astype(np.uint64)
 
@@ -251,7 +257,7 @@ def morton_order(x: np.ndarray, y: np.ndarray, block: int = 1024) -> np.ndarray:
         v = (v | (v << np.uint64(1))) & np.uint64(0x5555555555555555)
         return v
 
-    return np.argsort(spread(gx) | (spread(gy) << np.uint64(1)), kind="stable")
+    return spread(gx) | (spread(gy) << np.uint64(1))
 
 
 def to_spatialstream_batch(

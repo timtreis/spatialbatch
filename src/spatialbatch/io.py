@@ -21,6 +21,7 @@ from .utils import (
     aligned_tiles,
     element_to_cs_matrix,
     is_identity_xy,
+    morton_codes,
     morton_order,
     round_half_up,
     scale0,
@@ -412,6 +413,8 @@ def open_dataset_group(
             raise ValueError(f"{group.name} is tiled at read time but its table has no `obsm['spatial']`.")
         start = round_half_up(coords - crop_px / 2)
         geometry = TileGeometry(start[:, 0], start[:, 1], crop_px, crop_px)
+        # the writer's grid cells (write_collection_dataset sorts by these codes), for the loader's block sampler
+        blocks = morton_codes(coords[:, 0], coords[:, 1], meta["block_px"])
     else:
         if crop_px is not None:
             warnings.warn(
@@ -422,12 +425,13 @@ def open_dataset_group(
         origin = np.asarray(obsm["tile_origin"][...]).astype(np.int64)
         height, width = meta["tile_hw"]
         geometry = TileGeometry(origin[:, 0], origin[:, 1], height, width)
+        blocks = None  # sorted by tile centres in the source's coordinates, which are not stored
     sources: dict[str, _Source] = {}
     for kind, names in (("images", images), ("labels", labels)):
         for name in names:
             array = group[kind][name]
             sources[name] = _Source(kind, array, array.shape[0] if kind == "images" else None, array.dtype)
-    return X, obs, var, _Item(geometry, sources, coords)
+    return X, obs, var, _Item(geometry, sources, coords, blocks)
 
 
 def _read_table(

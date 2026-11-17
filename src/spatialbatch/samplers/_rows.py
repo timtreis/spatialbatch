@@ -50,12 +50,19 @@ def resolve_rows(rows: Rows, n_obs: int) -> np.ndarray:
 
 def _chunks(positions: np.ndarray, chunk_size: int) -> list[list[slice]]:
     """`positions` cut into chunks of `chunk_size` rows (the last may be shorter), each as its contiguous runs."""
-    i = np.arange(positions.size)
-    breaks = np.flatnonzero((i % chunk_size == 0) | np.concatenate([[True], np.diff(positions) != 1]))
+    return _runs(positions, np.arange(positions.size) % chunk_size == 0)
+
+
+def _runs(positions: np.ndarray, new_chunk: np.ndarray) -> list[list[slice]]:
+    """`positions` cut into chunks where `new_chunk` is ``True``, each chunk as the contiguous runs it spans."""
+    if positions.size == 0:
+        return []
+    breaks = np.flatnonzero(new_chunk | np.concatenate([[True], np.diff(positions) != 1]))
     ends = np.append(breaks[1:], positions.size)
-    chunks: list[list[slice]] = [[] for _ in range(math.ceil(positions.size / chunk_size))]
+    chunk_of = np.cumsum(new_chunk) - 1
+    chunks: list[list[slice]] = [[] for _ in range(int(chunk_of[-1]) + 1)]
     for b, e in zip(breaks, ends, strict=True):
-        chunks[b // chunk_size].append(slice(int(positions[b]), int(positions[e - 1]) + 1))
+        chunks[chunk_of[b]].append(slice(int(positions[b]), int(positions[e - 1]) + 1))
     return chunks
 
 
@@ -125,7 +132,7 @@ class RowsMixin:
         if worker_info is not None:
             shard = np.array_split(np.arange(len(chunks)), worker_info.num_workers)[worker_info.id]
             chunks = [chunks[i] for i in shard]
-        yield from self._requests(chunks, batch_rng)
+        yield from self._requests(self._groups(chunks), batch_rng)
 
     def _sample_all_once(self, n_obs: int) -> Iterator[LoadRequest]:
         """Every selected row once, in row order; each worker a contiguous share of the chunks. No shuffle, no drop.
@@ -138,17 +145,19 @@ class RowsMixin:
         if worker_info is not None:
             shard = np.array_split(np.arange(len(chunks)), worker_info.num_workers)[worker_info.id]
             chunks = [chunks[i] for i in shard]
-        yield from self._requests(chunks, None)
+        yield from self._requests(self._groups(chunks), None)
 
-    def _requests(self, chunks: list[list[slice]], batch_rng: np.random.Generator | None) -> Iterator[LoadRequest]:
-        """Requests of `preload_nchunks` chunks each; without `batch_rng` (evaluation) in order and without a drop."""
+    def _groups(self, chunks: list[list[slice]]) -> list[list[slice]]:
+        """The slices of each request: `preload_nchunks` chunks each."""
         per = self._preload_nchunks  # type: ignore[attr-defined]
-        groups = [chunks[i : i + per] for i in range(0, len(chunks), per)]
+        return [[s for chunk in chunks[i : i + per] for s in chunk] for i in range(0, len(chunks), per)]
+
+    def _requests(self, groups: list[list[slice]], batch_rng: np.random.Generator | None) -> Iterator[LoadRequest]:
+        """One request per group of slices; without `batch_rng` (evaluation) in order and without a drop."""
         batch_size = self.batch_size  # type: ignore[attr-defined]
         shuffle = batch_rng is not None and self.shuffle  # type: ignore[attr-defined]
         drop_last = batch_rng is not None and self._drop_last  # type: ignore[attr-defined]
-        for i, group in enumerate(groups):
-            requests = [s for chunk in group for s in chunk]
+        for i, requests in enumerate(groups):
             n = int(sum(s.stop - s.start for s in requests))
             if i == len(groups) - 1 and drop_last:
                 if n < batch_size:
