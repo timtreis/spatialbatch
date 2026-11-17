@@ -516,3 +516,38 @@ def test_return_annotations_reads_only_those_obs_columns(tmp_path, monkeypatch):
     assert len(batch["images"]["img"]) == 20
     with pytest.raises(KeyError, match="nope"):
         Loader(return_annotations=["nope"], **kwargs).use_collection(SpatialDatasetCollection(tmp_path / "c.zarr"))
+
+
+@pytest.mark.parametrize("tile_threads", [1, 4])
+def test_fused_pipeline_reads_the_same_tiles(tmp_path, tile_threads):
+    import pickle
+
+    import zarr.core.codec_pipeline as cp
+    from zarr.codecs import ZstdCodec
+
+    if not hasattr(cp, "FusedCodecPipeline"):
+        pytest.skip("this zarr has no FusedCodecPipeline")
+    table, image, labels = _centred_table()
+    collection = _write(tmp_path / "c.zarr", table, image, labels)
+    kwargs = {"images": ["img"], "labels": ["lab"], "crop_px": 33, "return_index": True, "batch_size": 20}
+    base = Loader(tile_threads=None, chunk_size=10, **kwargs).use_collection(collection)
+    fused = Loader(tile_threads=tile_threads, chunk_size=10, **kwargs).use_collection(collection)
+    for name in ("img", "lab"):
+        array = fused._items[0].sources[name].array
+        assert array.shards is not None and any(isinstance(c, ZstdCodec) for c in array.compressors)
+        assert type(base._items[0].sources[name].array.async_array.codec_pipeline) is cp.BatchedCodecPipeline
+        assert type(array.async_array.codec_pipeline) is cp.FusedCodecPipeline
+        assert type(pickle.loads(pickle.dumps(array)).async_array.codec_pipeline) is cp.FusedCodecPipeline
+    assert zarr.config.get("codec_pipeline.path") == "zarr.core.codec_pipeline.BatchedCodecPipeline"
+
+    height, width = image.shape[-2:]
+    n_border = 0
+    for a, b in zip(base, fused, strict=True):
+        np.testing.assert_array_equal(a["index"], b["index"])
+        for kind in ("images", "labels"):
+            for name, tiles in a[kind].items():
+                assert tiles.dtype == b[kind][name].dtype and tiles.tobytes() == b[kind][name].tobytes()
+        x0, y0 = np.floor(a["coords"] - 33 / 2 + 0.5).T
+        n_border += int(((x0 < 0) | (y0 < 0) | (x0 + 33 > width) | (y0 + 33 > height)).sum())
+    assert n_border > 0
+    assert zarr.config.get("codec_pipeline.max_workers") is None  # set only during the reads

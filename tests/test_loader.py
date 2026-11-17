@@ -340,3 +340,45 @@ def test_evaluation_loader_without_shuffle_takes_workers(synthetic):
     loader.set_rows(None, evaluate=True)
     index = np.concatenate([b["index"].numpy() for b in loader.to_torch(num_workers=2, pin_memory=False)])
     np.testing.assert_array_equal(np.sort(index), np.arange(200))
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_windows_group_tiles_by_centre_and_read_them_whole(tmp_path, monkeypatch, ref_tile, fused):
+    import zarr
+    from zarr.codecs import ZstdCodec
+    from zarr.core.sync import sync
+
+    import spatialbatch.loader as sl
+    from spatialbatch.utils import TileGeometry
+
+    image = np.random.default_rng(0).integers(1, 255, (2, 200, 200), dtype=np.uint8)
+    array = zarr.create_array(
+        tmp_path / "a.zarr",
+        shape=image.shape,
+        dtype=image.dtype,
+        chunks=(2, 16, 16),
+        shards=(2, 64, 64),
+        compressors=ZstdCodec(level=3),
+    )
+    array[...] = image
+    if fused:
+        array = sl._fused(array)
+    monkeypatch.setattr(sl, "_WINDOW_PX", 64)
+    # Centres (x, y) of 20 px tiles. Rows 0 and 1 have their centres in window (1, 1); row 0's tile starts in
+    # window (0, 0), where row 2 lies, and crosses the grid line at 64. Row 3 crosses the array border.
+    centres = np.array([[70, 70], [100, 90], [60, 60], [195, 5]])
+    geometry = TileGeometry(centres[:, 0] - 10, centres[:, 1] - 10, 20, 20)
+    windows = []
+    getitem = zarr.AsyncArray.getitem
+
+    async def spy(self, selection, *args, **kwargs):
+        windows.append(tuple((s.start, s.stop) for s in selection[-2:]))
+        return await getitem(self, selection, *args, **kwargs)
+
+    monkeypatch.setattr(zarr.AsyncArray, "getitem", spy)
+    out = np.empty((4, 2, 20, 20), np.uint8)
+    source = sl._Source("images", array, 2, array.dtype)
+    sync(Loader(images=["img"], crop_px=20)._fetch_tiles(source, geometry, np.arange(4), out))
+    assert sorted(windows) == [((0, 15), (185, 200)), ((50, 70), (50, 70)), ((60, 100), (60, 110))]
+    for row, (cx, cy) in enumerate(centres):
+        np.testing.assert_array_equal(out[row], ref_tile(image, cx, cy, 20))

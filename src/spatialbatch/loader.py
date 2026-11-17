@@ -4,6 +4,7 @@ import asyncio
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Self
@@ -41,8 +42,38 @@ if TYPE_CHECKING:
 
 __all__ = ["Loader"]
 
-# Side of the grid used to group the tiles of one request into windows that are each read from disk once.
+# Side of the grid used to group the tiles of one request into windows that are each read from disk once. It is the
+# default `block_px` of the collection writers, which sort the rows along a Z-curve over this grid of tile centres
+# (`morton_order` in utils.py, called in io.py), so a run of consecutive rows falls in few windows.
 _WINDOW_PX = 1024
+
+_BATCHED_PIPELINE = "zarr.core.codec_pipeline.BatchedCodecPipeline"
+_FUSED_PIPELINE = "zarr.core.codec_pipeline.FusedCodecPipeline"
+
+
+def _fused(array: zarr.Array) -> zarr.Array:
+    """`array`, reading through zarr's ``FusedCodecPipeline`` if this zarr has it and no other pipeline is configured.
+
+    zarr's default ``BatchedCodecPipeline`` schedules one coroutine, thread hop and file read per inner chunk of a
+    shard, and that Python work, under the GIL, is most of the CPU a tile read costs. ``FusedCodecPipeline`` (opt-in
+    in zarr 3.4.2, ``zarr/core/config.py:113-123``; its docstring at ``zarr/core/codec_pipeline.py:973-997``) decodes
+    the inner chunks of a shard synchronously from coalesced byte ranges (``ShardingCodec._decode_partial_sync``,
+    ``zarr/codecs/sharding.py:1288-1375``), with one thread hop per read.
+
+    The pipeline is fixed when an array is constructed (``AsyncArray.__init__`` calls ``create_codec_pipeline``,
+    ``zarr/core/array.py:428-434``, which reads ``codec_pipeline.path`` through ``get_pipeline_class``,
+    ``zarr/registry.py:458-468``), so setting the path only while this copy is built (``with_config``,
+    ``zarr/core/array.py:1218-1239``) scopes it to the tile arrays: ``X`` and every other array keep zarr's
+    configured pipeline. Pickling keeps the pipeline (``AsyncArray`` has no ``__getstate__``), so spawned DataLoader
+    workers read through it too. A pipeline the user configured (e.g. zarrs) is left alone.
+    """
+    import zarr.core.codec_pipeline
+
+    has_fused = hasattr(zarr.core.codec_pipeline, "FusedCodecPipeline")  # zarr >= 3.3
+    if not has_fused or zarr.config.get("codec_pipeline.path") != _BATCHED_PIPELINE:
+        return array
+    with zarr.config.set({"codec_pipeline.path": _FUSED_PIPELINE}):
+        return array.with_config({})
 
 
 @dataclass
@@ -183,6 +214,11 @@ class Loader(AnnbatchLoader):
         yields all of `X`, sparse.
     to
         Output library for `X` and for the tiles.
+    tile_threads
+        Threads per process that decode the tiles of a read, through zarr's ``FusedCodecPipeline`` (zarr >= 3.3),
+        which reads the tiles with much less CPU than zarr's default pipeline. ``None`` reads them through the
+        pipeline zarr is configured with, as does a zarr without it or a configured pipeline other than the default.
+        Only arrays tiled in place are affected, not `X`.
 
     Build a loader once and iterate it many times: opening a collection reads every dataset's ``obs`` and checks its
     contract (see :meth:`use_collection`). With a torch :class:`~torch.utils.data.DataLoader`, use :meth:`to_torch`.
@@ -238,6 +274,7 @@ class Loader(AnnbatchLoader):
         rows: slice | Sequence[slice] | np.ndarray | None = None,
         genes: Sequence[str] | None = None,
         to: Literal["torch", "jax"] | None = None,
+        tile_threads: int | None = 4,
     ):
         # whether to_torch may set drop_last: only on a sampler built here, where the caller left it unset
         self._drop_last_settable = batch_sampler is None and drop_last is None
@@ -275,6 +312,11 @@ class Loader(AnnbatchLoader):
         if crop_px is not None and (isinstance(crop_px, bool) or not isinstance(crop_px, int) or crop_px < 1):
             raise ValueError(f"`crop_px` must be a positive integer number of pixels, got {crop_px}.")
         self._tile_scale, self._tile_dim_in_units, self._crop_px = tile_scale, tile_dim_in_units, crop_px
+        if tile_threads is not None and (
+            isinstance(tile_threads, bool) or not isinstance(tile_threads, int) or tile_threads < 1
+        ):
+            raise ValueError(f"`tile_threads` must be a positive integer or None, got {tile_threads}.")
+        self._tile_threads = tile_threads
         self._rasterize, self._rasterize_kwargs = rasterize, dict(rasterize_kwargs)
         self._pad_value = pad_value
         self._annotations = [return_annotations] if isinstance(return_annotations, str) else return_annotations
@@ -362,6 +404,10 @@ class Loader(AnnbatchLoader):
 
     def _add_item(self, X: Any, obs: pd.DataFrame | None, var: pd.DataFrame | None, item: _Item) -> None:
         """Add a dataset together with its pixel sources, atomically."""
+        if self._tile_threads is not None:
+            for source in item.sources.values():
+                if source.array is not None:
+                    source.array = _fused(source.array)
         signature = {name: src.signature for name, src in item.sources.items()}
         hw = (item.geometry.height, item.geometry.width)
         if self._items:
@@ -626,7 +672,12 @@ class Loader(AnnbatchLoader):
         members = np.flatnonzero(inside)
         if members.size == 0:
             return
-        cells = (cy0[members] // _WINDOW_PX) * (width // _WINDOW_PX + 2) + cx0[members] // _WINDOW_PX
+        # Group by the window that holds the tile's centre: the writers sort rows by centre on this grid, while the
+        # clipped origins sit half a tile off it. A window reads the bounding box of its tiles, so a tile that
+        # crosses the grid is still read whole.
+        yc = np.clip(y0[members] + th // 2, 0, height - 1)
+        xc = np.clip(x0[members] + tw // 2, 0, width - 1)
+        cells = (yc // _WINDOW_PX) * (width // _WINDOW_PX + 1) + xc // _WINDOW_PX
         order = np.argsort(cells, kind="stable")
         members, cells = members[order], cells[order]
         bounds = np.flatnonzero(np.diff(cells)) + 1
@@ -717,7 +768,13 @@ class Loader(AnnbatchLoader):
             inv = inv_buffer[:n]
             inv[order] = positions[:n]
 
-            raw_out, pixels = zsync.sync(self._index_all(dataset_index_to_rows))
+            # The fused pipeline takes its thread count from the global config when it reads, not from the array
+            # (`max_workers=_resolve_max_workers()` in `FusedCodecPipeline.read`, zarr/core/codec_pipeline.py:1317-1319
+            # and :54-74 @ zarr 3.4.2), so it is set around the read. Only that pipeline reads this key
+            # (zarr/core/config.py:122), so the X read is unaffected; the setting is process-global while it is set.
+            threads = self._tile_threads
+            with nullcontext() if threads is None else zarr.config.set({"codec_pipeline.max_workers": threads}):
+                raw_out, pixels = zsync.sync(self._index_all(dataset_index_to_rows))
 
             if is_sparse:
                 in_memory_data = self._sp_module.csr_matrix(
