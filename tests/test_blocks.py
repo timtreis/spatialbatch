@@ -42,11 +42,11 @@ def _check_stream(requests: list[dict], starts: np.ndarray, selected: np.ndarray
 
 def test_requests_are_shuffled_whole_blocks_and_cover_every_row_once():
     starts = _starts(1000)
-    sampler = BlockSampler(16, 4, 16, rng=np.random.default_rng(0))
+    sampler = BlockSampler(40, 4, 16, rng=np.random.default_rng(0))
     sampler.block_starts = starts
     requests = _requests(sampler, 1000)
     sizes = [sum(s.stop - s.start for s in r["requests"]) for r in requests]
-    assert sizes[:-1] == [64] * (len(sizes) - 1) and sizes[-1] == 1000 - 64 * (len(sizes) - 1)
+    assert sizes[:-1] == [160] * (len(sizes) - 1) and sizes[-1] == 1000 - 160 * (len(sizes) - 1)
     _check_stream(requests, starts, np.arange(1000))
     heads = [r["requests"][0].start for r in requests]
     assert heads != sorted(heads)  # blocks in random order
@@ -57,11 +57,20 @@ def test_requests_are_shuffled_whole_blocks_and_cover_every_row_once():
     assert sum(len(r["splits"]) for r in requests) == sampler.n_batches(1000) == -(-1000 // 16)
 
 
+def test_blocks_longer_than_chunk_size_are_cut_into_chunk_size_runs():
+    starts = np.array([0, 10, 500])  # one block of 490 rows, as a whole slide on a low-resolution grid
+    sampler = BlockSampler(16, 4, 16, rng=np.random.default_rng(0))
+    sampler.block_starts = starts
+    requests = _requests(sampler, 600)
+    capped = np.unique(np.concatenate([np.arange(a, b, 16) for a, b in zip(starts, [*starts[1:], 600], strict=True)]))
+    _check_stream(requests, capped, np.arange(600))
+
+
 def test_rows_cut_blocks_to_the_selected_rows():
     starts = _starts(1000, seed=1)
     mask = np.random.default_rng(2).random(1000) < 0.6
     mask[300:450] = False
-    sampler = BlockSampler(16, 4, 16, rows=mask, rng=np.random.default_rng(0))
+    sampler = BlockSampler(40, 4, 16, rows=mask, rng=np.random.default_rng(0))
     sampler.block_starts = starts
     _check_stream(_requests(sampler, 1000), starts, np.flatnonzero(mask))
 
@@ -72,7 +81,7 @@ def test_workers_take_disjoint_shares_of_the_blocks(monkeypatch):
     starts = _starts(1000, seed=3)
     seen = []
     for worker in range(3):
-        sampler = BlockSampler(16, 4, 16, drop_last=True, rng=np.random.default_rng(5))
+        sampler = BlockSampler(40, 4, 16, drop_last=True, rng=np.random.default_rng(5))
         sampler.block_starts = starts
         requests = _requests(sampler, 1000, monkeypatch, WorkerInfo(worker, 3))
         rows = np.concatenate([np.arange(s.start, s.stop) for r in requests for s in r["requests"]])
@@ -87,7 +96,7 @@ def test_workers_take_disjoint_shares_of_the_blocks(monkeypatch):
 
 def test_needs_block_starts():
     with pytest.raises(RuntimeError, match="block starts"):
-        list(BlockSampler(16, 4, 16).sample(100))
+        list(BlockSampler(40, 4, 16).sample(100))
 
 
 # -- through the Loader, on a collection of several datasets ----------------------------------------------------------

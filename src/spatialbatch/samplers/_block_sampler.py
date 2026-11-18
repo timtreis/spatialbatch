@@ -25,7 +25,9 @@ class BlockSampler(RandomSampler):
     :func:`~spatialbatch.write_collection_dataset` sorts a dataset's rows along a Z-curve over a ``block_px`` grid of
     the cell centres, so the rows of one grid cell are consecutive and their tiles lie in one window of the image. This
     sampler draws those blocks (about 30 rows each for Visium spots at 0.5 µm/px and 1024 px) in random order instead
-    of fixed runs of `chunk_size` rows, so a request reads one window per block and still mixes many datasets.
+    of fixed runs of `chunk_size` rows, so a request reads one window per block and still mixes many datasets. A block
+    of more than `chunk_size` rows is cut into runs of `chunk_size` consecutive rows: at 5 µm/px a 1024 px cell holds
+    most of a Visium slide, and whole blocks gave 1.9 datasets per batch instead of 7.9 with row chunks.
 
     The blocks, in random order, are cut into requests of ``chunk_size * preload_nchunks`` rows, as for
     :class:`RandomSampler`; a block that crosses the end of a request continues in the next one. Each request is
@@ -40,7 +42,8 @@ class BlockSampler(RandomSampler):
     Parameters
     ----------
     chunk_size, preload_nchunks
-        A request holds ``chunk_size * preload_nchunks`` rows; it must be divisible by `batch_size`.
+        A request holds ``chunk_size * preload_nchunks`` rows; it must be divisible by `batch_size`. A block holds at
+        most `chunk_size` rows.
     batch_size
         Number of observations per batch.
     drop_last
@@ -77,7 +80,12 @@ class BlockSampler(RandomSampler):
         batch_rng = self._rng if worker_info is None else _spawn_worker_rng(self._rng, worker_info.id)
         positions = self._selected(n_obs)
         block = np.searchsorted(self.block_starts, positions, side="right")
-        blocks = _runs(positions, np.concatenate([[True], block[1:] != block[:-1]]))
+        new_block = np.concatenate([[True], block[1:] != block[:-1]])
+        # a block longer than chunk_size rows is cut into runs of chunk_size consecutive (Morton-ordered) rows: on a
+        # low-resolution image one block_px cell can hold most of a slide, and a request would then mix few datasets
+        nth = np.arange(positions.size)
+        in_block = nth - np.maximum.accumulate(np.where(new_block, nth, 0))
+        blocks = _runs(positions, in_block % self._chunk_size == 0)
         order = self._rng.permutation(len(blocks))  # the shared rng: every worker draws the same order
         if worker_info is not None:
             order = np.array_split(order, worker_info.num_workers)[worker_info.id]
